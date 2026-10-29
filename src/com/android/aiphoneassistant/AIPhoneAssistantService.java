@@ -155,6 +155,18 @@ public class AIPhoneAssistantService extends Service {
     private final List<String> mActionHistory = new ArrayList<>();
     private int mConsecutiveLlmErrors = 0;
     private int mConsecutiveCaptureFailures = 0;
+    // Fast/strong cascade: number of rounds in a row where the fast model
+    // produced no action (none/wait). Two in a row escalates to the strong
+    // model; any executed action resets it.
+    private int mConsecutiveNoAction = 0;
+    // Stuck detection for the fast/strong cascade: a perceptual signature of
+    // the last analysed frame and repeated-action bookkeeping. When the same
+    // screen keeps coming back (or the same action is issued twice), the fast
+    // model is looping and the strong model is called to judge instead.
+    private int[] mLastScreenLuma = null;
+    private int mRepeatedScreenRounds = 0;
+    private String mLastActionDesc = "";
+    private int mRepeatedActionCount = 0;
     // Generation counter for the in-flight analysis; bumped whenever a round
     // ends so a late timeout callback knows it is stale.
     private int mAnalyzeGen = 0;
@@ -324,6 +336,11 @@ public class AIPhoneAssistantService extends Service {
         mForcedRound = false;
         mConsecutiveLlmErrors = 0;
         mConsecutiveCaptureFailures = 0;
+        mConsecutiveNoAction = 0;
+        mLastScreenLuma = null;
+        mRepeatedScreenRounds = 0;
+        mLastActionDesc = "";
+        mRepeatedActionCount = 0;
         mLastEscalationAtMs = System.currentTimeMillis();
 
         mChatStore.appendStatus(mConvId, getString(R.string.chat_status_started_format, shorten(task)));
@@ -414,6 +431,49 @@ public class AIPhoneAssistantService extends Service {
     }
 
     /**
+     * Coarse 16x16 luma sample of a frame. Used only to detect "the same screen
+     * keeps coming back" - the trigger for escalating from the fast model to
+     * the strong model. A tolerant per-pixel comparison rather than an exact
+     * hash, so status-bar clocks or a blinking cursor do not count as a change.
+     */
+    private static int[] screenLuma(Bitmap bitmap) {
+        if (bitmap == null || bitmap.isRecycled()) {
+            return null;
+        }
+        Bitmap small = null;
+        try {
+            small = Bitmap.createScaledBitmap(bitmap, 16, 16, false);
+            int[] px = new int[16 * 16];
+            small.getPixels(px, 0, 16, 0, 0, 16, 16);
+            int[] luma = new int[px.length];
+            for (int i = 0; i < px.length; i++) {
+                int c = px[i];
+                luma[i] = (((c >> 16) & 0xff) * 30 + ((c >> 8) & 0xff) * 59
+                        + (c & 0xff) * 11) / 100;
+            }
+            return luma;
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (small != null && small != bitmap) {
+                small.recycle();
+            }
+        }
+    }
+
+    /** Whether two 16x16 luma samples are effectively the same screen. */
+    private static boolean isSameScreen(int[] a, int[] b) {
+        if (a == null || b == null || a.length != b.length) {
+            return false;
+        }
+        int total = 0;
+        for (int i = 0; i < a.length; i++) {
+            total += Math.abs(a[i] - b[i]);
+        }
+        return total <= (a.length * 4); // mean absolute difference <= 4/255
+    }
+
+    /**
      * Send the frame to the LLM and act on the reply. The mAnalyzing flag is
      * already set by the caller; it is cleared on completion (including
      * errors).
@@ -440,11 +500,40 @@ public class AIPhoneAssistantService extends Service {
             screenH = screenshot.getHeight();
         }
 
+        // Stuck detection ("small model acts immediately; call the big model
+        // when it is visibly looping"): compare a cheap 16x16 perceptual
+        // signature with the previous analysed frame. Two identical frames in
+        // a row means the fast model is spinning on the same screen.
+        int[] luma = screenLuma(screenshot);
+        if (isSameScreen(mLastScreenLuma, luma)) {
+            mRepeatedScreenRounds++;
+        } else {
+            mRepeatedScreenRounds = 0;
+            mLastScreenLuma = luma;
+        }
+        boolean screenLoop = mRepeatedScreenRounds >= 2;
+        if (screenLoop && mRepeatedScreenRounds == 2) {
+            Log.i(TAG, "Stuck: same screen analysed 3 rounds in a row; escalating");
+            Log.i(TAG, "The screen has not changed for 3 rounds; the previous "
+                    + "actions are likely looping. Try a different strategy (go back, "
+                    + "or open the app again).");
+        }
+        boolean actionLoop = mRepeatedActionCount >= 2;
+
+        // Fast/strong cascade: the fast model handles routine steps; only a
+        // stuck loop (repeated screen/action, watchdog round, two no-op rounds,
+        // or a request failure) escalates to the configured strong model.
+        boolean preferStrong = mForcedRound
+                || mConsecutiveNoAction >= 2
+                || mConsecutiveLlmErrors >= 1
+                || screenLoop
+                || actionLoop;
         mLLMClientService.analyzeScreen(screenshot,
                 screenW,
                 screenH,
                 mCurrentTask,
                 recentActionHistory(),
+                preferStrong,
                 new LLMClientService.LLMCallback() {
             @Override
             public void onDecision(LLMClientService.LLMDecision decision) {
@@ -527,6 +616,9 @@ public class AIPhoneAssistantService extends Service {
             }
 
             if (decision.kind == LLMClientService.LLMDecision.Kind.NONE) {
+                // No action = the fast model made no progress; escalate if it
+                // happens again. "wait" decisions are actions and reset this.
+                mConsecutiveNoAction++;
                 if (mForcedRound && mForcedReanalyses >= MAX_FORCED_REANALYSES) {
                     Log.i(TAG, "Watchdog exhausted with no model action; task stalled");
                     endExecutionStalled(null);
@@ -541,6 +633,7 @@ public class AIPhoneAssistantService extends Service {
                 // detector is re-baselined and the screen is re-analyzed.
                 return;
             }
+            mConsecutiveNoAction = 0;
 
             PointF point = decision.action.getPrimaryPoint();
             if (mOverlayController != null && point != null) {
@@ -573,8 +666,15 @@ public class AIPhoneAssistantService extends Service {
             mForcedReanalyses = 0;
             mForcedRound = false;
             if (decision.action.type != InputInjectionService.ActionType.WAIT) {
-                mActionHistory.add(decision.historyEntry != null
-                        ? decision.historyEntry : desc);
+                String executedDesc = decision.historyEntry != null
+                        ? decision.historyEntry : desc;
+                if (executedDesc.equals(mLastActionDesc)) {
+                    mRepeatedActionCount++;
+                } else {
+                    mLastActionDesc = executedDesc;
+                    mRepeatedActionCount = 0;
+                }
+                mActionHistory.add(executedDesc);
                 mChatStore.appendAction(mConvId, desc, mCurrentFrame);
                 broadcastState(ChatStore.STATE_EXECUTING);
             }

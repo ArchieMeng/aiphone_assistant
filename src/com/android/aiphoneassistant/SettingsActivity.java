@@ -51,9 +51,14 @@ public class SettingsActivity extends Activity {
     private TextView mTaskText;
     private TextView mEndpointText;
     private TextView mModelText;
+    private TextView mFastModelText;
+    private TextView mStrongModelText;
+    private TextView mThinkingText;
+    private TextView mStrongThinkingText;
     private TextView mApiKeyText;
     private TextView mIntervalText;
     private TextView mBackendText;
+    private TextView mStrongBackendText;
     private TextView mModelPathText;
     private TextView mAccelText;
     private ChatStore mStore;
@@ -119,7 +124,7 @@ public class SettingsActivity extends Activity {
         // the LiteRT-LM backend (WITH_LITERTLM); otherwise remote-only.
         if (LocalInference.isAvailable()) {
             // Backend: remote OpenAI-compatible API or on-device LiteRT-LM model
-            mBackendText = createConfigRow(layout, "Backend", backendDisplayValue());
+            mBackendText = createConfigRow(layout, "Fast Backend", backendDisplayValue());
             layout.addView(createButton("Change Backend", () -> editBackend()));
             addSpacer(layout);
 
@@ -154,6 +159,43 @@ public class SettingsActivity extends Activity {
         layout.addView(createButton("Change Model", () ->
                 showEditTextDialog("Model Name", LLMClientService.KEY_MODEL,
                         DEFAULT_MODEL, "e.g. gpt-4o, glm-4v-plus, qwen-vl-max")));
+        addSpacer(layout);
+
+        // Fast/strong cascade: routine steps use the fast (instant) model; the
+        // strong model is only consulted when the fast loop gets stuck.
+        mFastModelText = createConfigRow(layout, "Fast Model (instant)",
+                fastModelDisplayValue());
+        layout.addView(createButton("Change Fast Model", () ->
+                showEditTextDialog("Fast Model", LLMClientService.KEY_MODEL_FAST,
+                        "", "Empty = same as Model above. Use a NON-thinking, fast "
+                                + "vision model here (e.g. deepseek-chat, qwen-vl-plus, "
+                                + "gpt-4o-mini) for 1-3 s steps.")));
+        addSpacer(layout);
+
+        mStrongModelText = createConfigRow(layout, "Strong Model (only when stuck)",
+                strongModelDisplayValue());
+        layout.addView(createButton("Change Strong Model", () ->
+                showEditTextDialog("Strong Model", LLMClientService.KEY_MODEL_STRONG,
+                        "", "Empty = never escalate. Used only after two no-op rounds "
+                                + "or a request failure (e.g. a larger thinking model).")));
+        addSpacer(layout);
+
+        mThinkingText = createConfigRow(layout, "Fast Model Thinking",
+                thinkingDisplayValue());
+        layout.addView(createButton("Toggle Model Thinking", this::toggleDisableThinking));
+        addSpacer(layout);
+
+        mStrongThinkingText = createConfigRow(layout, "Strong Model Thinking",
+                strongThinkingDisplayValue());
+        layout.addView(createButton("Toggle Strong Model Thinking",
+                this::toggleStrongThinking));
+        addSpacer(layout);
+
+        // Strong rounds can use a different transport than fast rounds, e.g.
+        // fast = on-device and strong = online.
+        mStrongBackendText = createConfigRow(layout, "Strong Backend",
+                strongBackendDisplayValue());
+        layout.addView(createButton("Change Strong Backend", () -> editStrongBackend()));
         addSpacer(layout);
 
         // API key
@@ -201,6 +243,16 @@ public class SettingsActivity extends Activity {
                 ? "On-device (LiteRT-LM)" : "Remote API (OpenAI-compatible)";
     }
 
+    private String strongBackendDisplayValue() {
+        String value = mPrefs.getString(LLMClientService.KEY_STRONG_BACKEND, "");
+        if (value == null || value.trim().isEmpty()) {
+            return "Same as Fast Backend (" + (LLMClientService.isLocalBackend(mPrefs)
+                    ? "On-device" : "Remote API") + ")";
+        }
+        return LLMClientService.BACKEND_LOCAL.equals(value)
+                ? "On-device (LiteRT-LM)" : "Remote API (OpenAI-compatible)";
+    }
+
     private String accelDisplayValue() {
         return LocalInference.ACCEL_CPU.equals(LLMClientService.localAccel(this))
                 ? "CPU" : "GPU (falls back to CPU)";
@@ -214,6 +266,34 @@ public class SettingsActivity extends Activity {
                 .setTitle("Backend")
                 .setSingleChoiceItems(labels, checked, (dialog, which) -> {
                     mPrefs.edit().putString(LLMClientService.KEY_BACKEND, values[which]).apply();
+                    updateDisplay();
+                    dialog.dismiss();
+                })
+                .setNegativeButton(R.string.action_cancel, null)
+                .show();
+    }
+
+    private void editStrongBackend() {
+        final String[] labels = {
+                "Same as Fast Backend",
+                "Remote API (OpenAI-compatible; uses Endpoint/API Key/Strong Model)",
+                "On-device (LiteRT-LM; uses Model Path/Accelerator)",
+        };
+        final String[] values = {"", LLMClientService.BACKEND_REMOTE,
+                LLMClientService.BACKEND_LOCAL};
+        String current = mPrefs.getString(LLMClientService.KEY_STRONG_BACKEND, "");
+        int checked = 0;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i].equals(current == null ? "" : current.trim())) {
+                checked = i;
+                break;
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Strong Backend")
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    mPrefs.edit().putString(LLMClientService.KEY_STRONG_BACKEND,
+                            values[which]).apply();
                     updateDisplay();
                     dialog.dismiss();
                 })
@@ -374,8 +454,56 @@ public class SettingsActivity extends Activity {
         builder.show();
     }
 
+    private String fastModelDisplayValue() {
+        String fast = mPrefs.getString(LLMClientService.KEY_MODEL_FAST, "");
+        if (fast == null || fast.trim().isEmpty()) {
+            return "(same as Model: " + mPrefs.getString(LLMClientService.KEY_MODEL,
+                    DEFAULT_MODEL) + ")";
+        }
+        return fast;
+    }
+
+    private String strongModelDisplayValue() {
+        String strong = mPrefs.getString(LLMClientService.KEY_MODEL_STRONG, "");
+        return strong == null || strong.trim().isEmpty()
+                ? "(never - no escalation)" : strong;
+    }
+
+    private String thinkingDisplayValue() {
+        boolean disabled = mPrefs.getBoolean(LLMClientService.KEY_DISABLE_THINKING,
+                LLMClientService.DEFAULT_DISABLE_THINKING);
+        return (disabled ? "disabled (fast replies)" : "enabled (model may reason)")
+                + " - strong rounds may always think";
+    }
+
+    private String strongThinkingDisplayValue() {
+        boolean on = mPrefs.getBoolean(LLMClientService.KEY_STRONG_THINKING,
+                LLMClientService.DEFAULT_STRONG_THINKING);
+        return on ? "allowed (4096-token planning budget)"
+                : "suppressed (same fast policy)";
+    }
+
+    private void toggleStrongThinking() {
+        boolean current = mPrefs.getBoolean(LLMClientService.KEY_STRONG_THINKING,
+                LLMClientService.DEFAULT_STRONG_THINKING);
+        mPrefs.edit().putBoolean(LLMClientService.KEY_STRONG_THINKING, !current).apply();
+        updateDisplay();
+        Toast.makeText(this, strongThinkingDisplayValue(), Toast.LENGTH_SHORT).show();
+    }
+
+    private void toggleDisableThinking() {
+        boolean current = mPrefs.getBoolean(LLMClientService.KEY_DISABLE_THINKING,
+                LLMClientService.DEFAULT_DISABLE_THINKING);
+        mPrefs.edit().putBoolean(LLMClientService.KEY_DISABLE_THINKING, !current).apply();
+        updateDisplay();
+        Toast.makeText(this, thinkingDisplayValue(), Toast.LENGTH_SHORT).show();
+    }
+
     private void updateDisplay() {
         mTaskText.setText(taskDisplayValue());
+        if (mStrongBackendText != null) {
+            mStrongBackendText.setText(strongBackendDisplayValue());
+        }
         if (mBackendText != null) {
             mBackendText.setText(backendDisplayValue());
             mModelPathText.setText(LLMClientService.localModelPath(this));
@@ -385,6 +513,18 @@ public class SettingsActivity extends Activity {
                 mEndpointText.getText().toString()));
         mModelText.setText(mPrefs.getString(LLMClientService.KEY_MODEL,
                 mModelText.getText().toString()));
+        if (mFastModelText != null) {
+            mFastModelText.setText(fastModelDisplayValue());
+        }
+        if (mStrongModelText != null) {
+            mStrongModelText.setText(strongModelDisplayValue());
+        }
+        if (mThinkingText != null) {
+            mThinkingText.setText(thinkingDisplayValue());
+        }
+        if (mStrongThinkingText != null) {
+            mStrongThinkingText.setText(strongThinkingDisplayValue());
+        }
         mApiKeyText.setText(maskApiKey(mPrefs.getString(LLMClientService.KEY_API_KEY, "")));
         mIntervalText.setText(String.valueOf(mPrefs.getInt(LLMClientService.KEY_CAPTURE_INTERVAL,
                 LLMClientService.DEFAULT_CAPTURE_INTERVAL_MS)));
