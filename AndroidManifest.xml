@@ -68,6 +68,9 @@
              use_embedded_native_libs; tools/build-apk.sh: WITH_LITERTLM). -->
         <uses-native-library android:name="libOpenCL.so" android:required="false" />
         <uses-native-library android:name="libvndksupport.so" android:required="false" />
+        <!-- Qualcomm FastRPC, needed by the optional NPU (QNN/CDSP) backend -->
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <uses-native-library android:name="libadsprpc.so" android:required="false" />
 
         <!-- Main service: screen capture + LLM + input injection -->
         <service

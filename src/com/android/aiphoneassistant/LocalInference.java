@@ -35,6 +35,13 @@ import java.io.IOException;
 interface LocalInference {
     String ACCEL_GPU = "gpu";
     String ACCEL_CPU = "cpu";
+    /**
+     * Qualcomm Hexagon NPU (LiteRT NPU dispatch + QNN). Requires the optional
+     * NPU runtime libraries (libLiteRtDispatch_Qualcomm.so + libQnn*), either
+     * bundled in the APK or placed in a readable directory; the backend falls
+     * back to GPU/CPU when they are missing or incompatible.
+     */
+    String ACCEL_NPU = "npu";
 
     /**
      * Run one prompt (optionally with a JPEG image) and return the full text
@@ -44,7 +51,7 @@ interface LocalInference {
     String generate(String modelPath, String accel, String prompt, byte[] image,
             String jsonSchema) throws IOException;
 
-    /** Accelerator actually in use ("gpu"/"cpu"), or null before loading. */
+    /** Accelerator actually in use ("npu"/"gpu"/"cpu"), or null before loading. */
     String loadedAccel();
 
     /** Abort the in-flight generation; safe to call from any thread. */
