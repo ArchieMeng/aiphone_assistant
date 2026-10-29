@@ -21,6 +21,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.app.StatusBarManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
@@ -30,6 +31,7 @@ import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
 import android.media.ImageReader;
+import android.net.Uri;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -95,6 +97,9 @@ public class AIPhoneAssistantService extends Service {
     // event, so the injection has been dispatched before touches are captured
     // by the bar again.
     private static final long BAR_RETOUCH_DELAY_MS = 120;
+    // Window transitions from open_uri need time to draw before the next
+    // capture; otherwise the model sees the old screen again.
+    private static final long APP_LAUNCH_SETTLE_MS = 900;
     // Only log the first of a run of consecutive capture failures
     private static final int CAPTURE_FAILURE_LOG_THRESHOLD = 3;
     // Give up (stalled) after this many consecutive LLM request failures
@@ -542,6 +547,23 @@ public class AIPhoneAssistantService extends Service {
                 return;
             }
 
+            // A batch reply runs its gesture steps blindly; the fresh
+            // screenshot taken afterwards is the first feedback the model gets.
+            if (decision.steps != null && !decision.steps.isEmpty()) {
+                executeBatch(decision.steps);
+                return;
+            }
+
+            // Device-level actions are not input injections: they need no
+            // coordinates and the next screenshot shows their effect.
+            if (decision.action.type == InputInjectionService.ActionType.OPEN_URI
+                    || decision.action.type == InputInjectionService.ActionType.EXPAND_NOTIFICATIONS
+                    || decision.action.type
+                            == InputInjectionService.ActionType.EXPAND_QUICK_SETTINGS) {
+                handleDeviceAction(decision.action);
+                return;
+            }
+
             PointF point = decision.action.getPrimaryPoint();
             if (mOverlayController != null && point != null) {
                 mOverlayController.showActing(point.x, point.y);
@@ -589,6 +611,118 @@ public class AIPhoneAssistantService extends Service {
                 mOverlayController.hide();
             }
         }
+    }
+
+    /**
+     * Execute a batch of gesture steps blindly in order (the model decided
+     * they do not depend on intermediate screens), then let the normal frame
+     * loop take a fresh screenshot. Batch steps are only injection actions.
+     */
+    private void executeBatch(List<InputInjectionService.InputAction> steps) {
+        StringBuilder executed = new StringBuilder();
+        PointF firstPoint = steps.get(0).getPrimaryPoint();
+        if (mOverlayController != null && firstPoint != null) {
+            mOverlayController.showActing(firstPoint.x, firstPoint.y);
+        }
+        if (mOverlayController != null) {
+            mOverlayController.setInterruptBarTouchable(false);
+        }
+        boolean completed = true;
+        for (int i = 0; i < steps.size(); i++) {
+            if (mInterrupted || mPaused.get()) {
+                completed = false;
+                break;
+            }
+            InputInjectionService.InputAction step = steps.get(i);
+            String d = describeAction(step);
+            updateFgNotification(getString(R.string.notification_acting_format, d));
+            if (!mInputInjectionService.executeAction(step)) {
+                completed = false;
+                break;
+            }
+            if (executed.length() > 0) {
+                executed.append("; ");
+            }
+            executed.append(d);
+            if (step.type != InputInjectionService.ActionType.WAIT) {
+                sleepQuietly(120);
+            }
+        }
+        sleepQuietly(BAR_RETOUCH_DELAY_MS);
+        if (mOverlayController != null) {
+            mOverlayController.setInterruptBarTouchable(true);
+        }
+        if (!completed || mInterrupted) {
+            return;
+        }
+        mFrameDetector.notifyActionInjected();
+        mForcedReanalyses = 0;
+        mForcedRound = false;
+        String desc = "batch(" + steps.size() + "): " + executed;
+        if (desc.length() > 240) {
+            desc = desc.substring(0, 237) + "…";
+        }
+        mActionHistory.add(desc);
+        mChatStore.appendAction(mConvId, desc, mCurrentFrame);
+        broadcastState(ChatStore.STATE_EXECUTING);
+    }
+
+    /**
+     * Execute device-level actions: {@code open_uri} and panel expansion
+     * ({@code expand_notifications} / {@code expand_quick_settings}). They are
+     * not input injections, so the outcome cannot be observed directly; the
+     * next screenshot shows it. Runs on the capture thread.
+     */
+    private void handleDeviceAction(InputInjectionService.InputAction action) {
+        String desc;
+        if (action.type == InputInjectionService.ActionType.OPEN_URI) {
+            String uri = action.uri == null ? "" : action.uri.trim();
+            if (uri.isEmpty()) {
+                Log.w(TAG, "open_uri without a uri");
+                desc = "open_uri failed: no uri";
+            } else {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(uri));
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(intent);
+                    desc = "Opened URI: " + shorten(uri);
+                    mFrameDetector.notifyActionInjected();
+                    sleepQuietly(APP_LAUNCH_SETTLE_MS);
+                } catch (Exception e) {
+                    Log.w(TAG, "open_uri failed: " + uri, e);
+                    desc = "open_uri failed: " + uri;
+                }
+            }
+        } else {
+            boolean notifications = action.type
+                    == InputInjectionService.ActionType.EXPAND_NOTIFICATIONS;
+            desc = notifications ? "expand_notifications" : "expand_quick_settings";
+            try {
+                StatusBarManager statusBar = getSystemService(StatusBarManager.class);
+                if (statusBar == null) {
+                    Log.w(TAG, "StatusBarManager unavailable");
+                } else if (notifications) {
+                    statusBar.expandNotificationsPanel();
+                    desc = "Notification shade opened";
+                    mFrameDetector.notifyActionInjected();
+                    sleepQuietly(500);
+                } else {
+                    statusBar.expandSettingsPanel(null);
+                    desc = "Quick settings opened";
+                    mFrameDetector.notifyActionInjected();
+                    sleepQuietly(500);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Panel expand failed", e);
+            }
+        }
+        Log.i(TAG, "Device action: " + desc);
+        mActionHistory.add(desc);
+        mChatStore.appendAction(mConvId, desc, mCurrentFrame);
+        mForcedReanalyses = 0;
+        mForcedRound = false;
+        broadcastState(ChatStore.STATE_EXECUTING);
+        updateFgNotification(getString(R.string.notification_acting_format, desc));
     }
 
     private void handleLlmError() {
@@ -944,6 +1078,17 @@ public class AIPhoneAssistantService extends Service {
                 return getString(R.string.chat_action_key_format, keyName);
             case TEXT_INPUT:
                 return getString(R.string.chat_action_text_format, action.text);
+            case DRAG:
+                return "drag (" + (int) action.x + "," + (int) action.y + ") -> ("
+                        + (int) action.endX + "," + (int) action.endY + ")";
+            case DOUBLE_TAP:
+                return "double_tap (" + (int) action.x + "," + (int) action.y + ")";
+            case OPEN_URI:
+                return "open_uri " + (action.uri == null ? "" : action.uri);
+            case EXPAND_NOTIFICATIONS:
+                return "expand_notifications";
+            case EXPAND_QUICK_SETTINGS:
+                return "expand_quick_settings";
             case WAIT:
                 return getString(R.string.chat_action_wait_format, action.durationMs);
             default:

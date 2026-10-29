@@ -37,6 +37,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -84,6 +85,8 @@ public class LLMClientService {
     // coordinates so injections land where the model intended.
     private static final int JPEG_QUALITY = 80;
     private static final int MAX_IMAGE_SIZE = 1024;
+    /** Upper bound for one batch reply, so a bad reply cannot flood the UI. */
+    private static final int MAX_BATCH_STEPS = 12;
     // On-device the vision encoder resizes anyway; a smaller JPEG keeps the
     // decode + preprocessing cheap.
     private static final int LOCAL_MAX_IMAGE_SIZE = 768;
@@ -95,12 +98,14 @@ public class LLMClientService {
             "{\"type\":\"integer\",\"minimum\":0,\"maximum\":1000}";
     private static final String ACTION_SCHEMA = "{\"type\":\"object\",\"properties\":{"
             + "\"action\":{\"type\":\"string\",\"enum\":[\"tap\",\"swipe\","
-            + "\"long_press\",\"scroll\",\"key_press\",\"text_input\",\"wait\","
+            + "\"long_press\",\"double_tap\",\"scroll\",\"key_press\",\"text_input\","
+            + "\"wait\",\"open_uri\",\"expand_notifications\",\"expand_quick_settings\","
             + "\"none\",\"done\"]},"
             + "\"x\":" + COORD + ",\"y\":" + COORD + ","
             + "\"endX\":" + COORD + ",\"endY\":" + COORD + ","
             + "\"deltaY\":{\"type\":\"integer\"},\"durationMs\":{\"type\":\"integer\"},"
             + "\"key\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
+            + "\"uri\":{\"type\":\"string\"},"
             + "\"summary\":{\"type\":\"string\"}},"
             + "\"required\":[\"action\"],\"additionalProperties\":false}";
 
@@ -375,12 +380,18 @@ public class LLMClientService {
                 .append("{\"action\":\"swipe\",\"x\":<int>,\"y\":<int>,\"endX\":<int>,\"endY\":<int>,")
                 .append("\"durationMs\":<int>}\n")
                 .append("{\"action\":\"long_press\",\"x\":<int>,\"y\":<int>,\"durationMs\":<int>}\n")
+                .append("{\"action\":\"double_tap\",\"x\":<int>,\"y\":<int>}\n")
                 .append("{\"action\":\"scroll\",\"x\":<int>,\"y\":<int>,\"deltaY\":<int>}")
                 .append("  // negative deltaY scrolls content up\n")
                 .append("{\"action\":\"key_press\",\"key\":\"BACK\"}")
                 .append("  // BACK, HOME, APP_SWITCH, ENTER, DEL, DPAD_UP, DPAD_DOWN, VOLUME_UP...\n")
                 .append("{\"action\":\"text_input\",\"text\":\"...\"}")
                 .append("  // only when a text field is focused\n")
+                .append("{\"action\":\"open_uri\",\"uri\":\"<https://... or app deep link>\"}\n")
+                .append("{\"action\":\"expand_notifications\"}")
+                .append("  // pull down the notification shade\n")
+                .append("{\"action\":\"expand_quick_settings\"}")
+                .append("  // pull down quick settings\n")
                 .append("{\"action\":\"wait\",\"durationMs\":<int>}")
                 .append("  // when the screen is still loading\n")
                 .append("{\"action\":\"none\"}")
@@ -388,6 +399,14 @@ public class LLMClientService {
                 .append("{\"action\":\"done\",\"summary\":\"<one short sentence>\"}")
                 .append("  // ONLY when the task's goal is now VISIBLY achieved on this screen; ")
                 .append("write the summary in the same language as the user's task\n")
+                .append("BATCH: instead of one action you may return ")
+                .append("{\"steps\":[{...},{...}]} with up to 12 gesture steps ")
+                .append("(tap/swipe/drag/long_press/double_tap/key_press/text_input/scroll/wait). ")
+                .append("They run in order and then a new screenshot is taken, which is much ")
+                .append("faster for known blind sequences (search flow, game combos, repeated ")
+                .append("taps). Do NOT batch steps whose choice depends on intermediate screens, ")
+                .append("and never put open_uri/expand_notifications/expand_quick_settings ")
+                .append("inside steps.\n")
                 .append(normalizedCoords
                         ? "Coordinates are normalized to 0-" + NORMALIZED_COORDS + " on both axes "
                                 + "(0,0 = top-left, " + NORMALIZED_COORDS + "," + NORMALIZED_COORDS
@@ -575,6 +594,83 @@ public class LLMClientService {
     }
 
     /**
+     * Parse one gesture step of a batch reply. Only injection actions are
+     * accepted (device actions like open_uri need a fresh screenshot first).
+     * Returns null for anything unknown so the caller can skip it.
+     */
+    private InputInjectionService.InputAction parseBatchStep(JSONObject step) {
+        if (step == null) {
+            return null;
+        }
+        String t = step.optString("action", "").trim().toLowerCase();
+        switch (t) {
+            case "tap":
+            case "click":
+                if (!step.has("x") || !step.has("y")) {
+                    return null;
+                }
+                return InputInjectionService.InputAction.tap(
+                        (float) step.optDouble("x"), (float) step.optDouble("y"));
+            case "swipe":
+                if (!step.has("x") || !step.has("y")
+                        || !step.has("endX") || !step.has("endY")) {
+                    return null;
+                }
+                return InputInjectionService.InputAction.swipe(
+                        (float) step.optDouble("x"), (float) step.optDouble("y"),
+                        (float) step.optDouble("endX"), (float) step.optDouble("endY"),
+                        clampMs(step.optLong("durationMs", 300)));
+            case "drag":
+                if (!step.has("x") || !step.has("y")
+                        || !step.has("endX") || !step.has("endY")) {
+                    return null;
+                }
+                return InputInjectionService.InputAction.drag(
+                        (float) step.optDouble("x"), (float) step.optDouble("y"),
+                        (float) step.optDouble("endX"), (float) step.optDouble("endY"),
+                        step.optLong("durationMs", 700));
+            case "long_press":
+                if (!step.has("x") || !step.has("y")) {
+                    return null;
+                }
+                return InputInjectionService.InputAction.longPress(
+                        (float) step.optDouble("x"), (float) step.optDouble("y"),
+                        clampMs(step.optLong("durationMs", 800)));
+            case "double_tap":
+                if (!step.has("x") || !step.has("y")) {
+                    return null;
+                }
+                return InputInjectionService.InputAction.doubleTap(
+                        (float) step.optDouble("x"), (float) step.optDouble("y"));
+            case "key_press": {
+                int keyCode = InputInjectionService.keyNameToKeyCode(
+                        step.optString("key", ""));
+                return keyCode == 0
+                        ? null : InputInjectionService.InputAction.keyPress(keyCode);
+            }
+            case "text_input":
+            case "type": {
+                String text = step.optString("text", "");
+                return text.isEmpty()
+                        ? null : InputInjectionService.InputAction.textInput(text);
+            }
+            case "scroll": {
+                if (!step.has("x") || !step.has("y")) {
+                    return null;
+                }
+                return InputInjectionService.InputAction.scroll(
+                        (float) step.optDouble("x"), (float) step.optDouble("y"),
+                        (float) step.optDouble("deltaY", 500));
+            }
+            case "wait":
+                return InputInjectionService.InputAction.waitAction(
+                        clampMs(step.optLong("durationMs", 800)));
+            default:
+                return null;
+        }
+    }
+
+    /**
      * Parse the model's reply into a {@link LLMDecision} with REAL screen
      * coordinates. Malformed replies or actions with missing required fields
      * yield {@code none} — never a guessed default tap.
@@ -593,6 +689,39 @@ public class LLMClientService {
             }
             JSONObject json = new JSONObject(response.substring(jsonStart, jsonEnd + 1));
             String actionType = json.optString("action", "").trim().toLowerCase();
+
+            // The model saw the downscaled image; map coordinates back to the
+            // real screen so injections land where the model intended.
+            float sx = screenW / (float) imageW;
+            float sy = screenH / (float) imageH;
+
+            // Batch reply: {"steps":[{action},...]}. Executed blindly in order
+            // (device actions are not allowed inside batches), then the service
+            // takes a fresh screenshot - this is the latency win for known
+            // sequences (search flows, game combos).
+            JSONArray stepsArray = json.optJSONArray("steps");
+            if (stepsArray != null && stepsArray.length() > 0) {
+                List<InputInjectionService.InputAction> steps = new ArrayList<>();
+                for (int i = 0; i < stepsArray.length() && steps.size() < MAX_BATCH_STEPS; i++) {
+                    InputInjectionService.InputAction step =
+                            parseBatchStep(stepsArray.optJSONObject(i));
+                    if (step == null) {
+                        continue;
+                    }
+                    step.x *= sx;
+                    step.y *= sy;
+                    step.endX *= sx;
+                    step.endY *= sy;
+                    step.deltaY *= sy;
+                    steps.add(step);
+                }
+                if (!steps.isEmpty()) {
+                    Log.i(TAG, "Model returned a batch of " + steps.size() + " steps");
+                    return LLMDecision.batch(steps, response);
+                }
+                Log.w(TAG, "Batch reply had no usable steps");
+                return LLMDecision.none(response);
+            }
 
             // Task completion. The legacy synonyms map to done as well — models
             // trained on older prompts still answer finish/complete/stop.
@@ -648,6 +777,20 @@ public class LLMClientService {
                             clampMs(json.optLong("durationMs", 800)));
                     break;
 
+                case "drag":
+                case "swipe_hold": {
+                    if (!json.has("x") || !json.has("y")
+                            || !json.has("endX") || !json.has("endY")) {
+                        Log.w(TAG, "drag missing endpoints, ignoring");
+                        return LLMDecision.none(response);
+                    }
+                    action = InputInjectionService.InputAction.drag(
+                            (float) json.getDouble("x"), (float) json.getDouble("y"),
+                            (float) json.getDouble("endX"), (float) json.getDouble("endY"),
+                            json.optLong("durationMs", 700));
+                    break;
+                }
+
                 case "scroll":
                 case "scroll_up":
                 case "scroll_down":
@@ -689,6 +832,46 @@ public class LLMClientService {
                     break;
                 }
 
+                case "double_tap":
+                case "doubletap": {
+                    if (!json.has("x") || !json.has("y")) {
+                        Log.w(TAG, "double_tap without coordinates, ignoring");
+                        return LLMDecision.none(response);
+                    }
+                    action = InputInjectionService.InputAction.doubleTap(
+                            (float) json.getDouble("x"), (float) json.getDouble("y"));
+                    break;
+                }
+
+                case "open_uri":
+                case "open_url":
+                case "url": {
+                    String uri = json.optString("uri", "").trim();
+                    if (uri.isEmpty()) {
+                        uri = json.optString("url", "").trim();
+                    }
+                    if (uri.isEmpty()) {
+                        Log.w(TAG, "open_uri without a uri, ignoring");
+                        return LLMDecision.none(response);
+                    }
+                    action = InputInjectionService.InputAction.openUri(uri);
+                    break;
+                }
+
+                case "expand_notifications":
+                case "notifications":
+                case "open_notifications": {
+                    action = InputInjectionService.InputAction.expandNotifications();
+                    break;
+                }
+
+                case "expand_quick_settings":
+                case "quick_settings":
+                case "open_quick_settings": {
+                    action = InputInjectionService.InputAction.expandQuickSettings();
+                    break;
+                }
+
                 case "wait":
                     action = InputInjectionService.InputAction.waitAction(
                             json.optLong("durationMs", 1000));
@@ -701,8 +884,6 @@ public class LLMClientService {
 
             // The model saw the downscaled image; map coordinates back to the
             // real screen so injections land where the model intended.
-            float sx = screenW / (float) imageW;
-            float sy = screenH / (float) imageH;
             action.x *= sx;
             action.y *= sy;
             action.endX *= sx;
@@ -761,6 +942,8 @@ public class LLMClientService {
         public final Kind kind;
         /** Non-null only for {@link Kind#ACTION}; coordinates in screen pixels. */
         public final InputInjectionService.InputAction action;
+        /** Non-null when this reply is a batch of gesture steps. */
+        public final List<InputInjectionService.InputAction> steps;
         /** One-sentence summary of what was achieved; only for {@link Kind#DONE}. */
         public final String summary;
         public final String raw;
@@ -771,33 +954,35 @@ public class LLMClientService {
         public final String historyEntry;
 
         private LLMDecision(Kind kind, InputInjectionService.InputAction action,
-                String summary, String raw) {
-            this(kind, action, summary, raw, null);
-        }
-
-        private LLMDecision(Kind kind, InputInjectionService.InputAction action,
+                List<InputInjectionService.InputAction> steps,
                 String summary, String raw, String historyEntry) {
             this.kind = kind;
             this.action = action;
+            this.steps = steps;
             this.summary = summary;
             this.raw = raw;
             this.historyEntry = historyEntry;
         }
 
         LLMDecision withHistoryEntry(String entry) {
-            return new LLMDecision(kind, action, summary, raw, entry);
+            return new LLMDecision(kind, action, steps, summary, raw, entry);
         }
 
         public static LLMDecision action(InputInjectionService.InputAction action, String raw) {
-            return new LLMDecision(Kind.ACTION, action, null, raw);
+            return new LLMDecision(Kind.ACTION, action, null, null, raw, null);
+        }
+
+        public static LLMDecision batch(List<InputInjectionService.InputAction> steps,
+                String raw) {
+            return new LLMDecision(Kind.ACTION, steps.get(0), steps, null, raw, null);
         }
 
         public static LLMDecision done(String summary, String raw) {
-            return new LLMDecision(Kind.DONE, null, summary, raw);
+            return new LLMDecision(Kind.DONE, null, null, summary, raw, null);
         }
 
         public static LLMDecision none(String raw) {
-            return new LLMDecision(Kind.NONE, null, null, raw);
+            return new LLMDecision(Kind.NONE, null, null, null, raw, null);
         }
     }
 }
