@@ -23,6 +23,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.LauncherApps;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.graphics.PointF;
@@ -105,6 +106,12 @@ public class AIPhoneAssistantService extends Service {
     private static final long ANALYZE_TIMEOUT_MS = 300000;
     // How many recent actions are included in the prompt
     private static final int PROMPT_ACTION_HISTORY = 8;
+    // How many device observations (list_apps / open_app results) to keep
+    private static final int PROMPT_OBSERVATION_LIMIT = 6;
+    // Hard cap on one observation: a list_apps answer is naturally long
+    private static final int OBSERVATION_MAX_CHARS = 2400;
+    // Settle time after launching an app before the next capture
+    private static final long APP_LAUNCH_SETTLE_MS = 900;
     private static final int TASK_TITLE_MAX_LEN = 40;
 
     // Stale-task watchdog: when a task is executing but nothing has been
@@ -153,11 +160,19 @@ public class AIPhoneAssistantService extends Service {
     private volatile long mConvId;
     private Bitmap mCurrentFrame;
     private final List<String> mActionHistory = new ArrayList<>();
+    /**
+     * Non-visual results (list_apps catalogue slices, open_app failures) that
+     * the next prompt must see. Bounded: a full app catalogue would consume
+     * the whole context for no benefit.
+     */
+    private final List<String> mObservations = new ArrayList<>();
     private int mConsecutiveLlmErrors = 0;
     private int mConsecutiveCaptureFailures = 0;
     // Generation counter for the in-flight analysis; bumped whenever a round
     // ends so a late timeout callback knows it is stale.
     private int mAnalyzeGen = 0;
+    /** Force the next captured frame to be analysed even without a visual change. */
+    private volatile boolean mForceNextAnalysis = false;
 
     /** Cheap liveness check for the UI (ChatActivity header). */
     public static boolean isRunning() {
@@ -320,6 +335,10 @@ public class AIPhoneAssistantService extends Service {
         mPaused.set(false);
         mInputInjectionService.setAborted(false);
         mActionHistory.clear();
+        mObservations.clear();
+        // Enumerating a few hundred packages costs a second; get it off the
+        // capture thread before the model first asks for apps.
+        AppCatalog.warmUp(this);
         mForcedReanalyses = 0;
         mForcedRound = false;
         mConsecutiveLlmErrors = 0;
@@ -368,16 +387,28 @@ public class AIPhoneAssistantService extends Service {
                         mConsecutiveCaptureFailures = 0;
                         long now = System.currentTimeMillis();
                         boolean stale = now - mLastEscalationAtMs >= STALE_TASK_REANALYZE_MS;
-                        boolean allowForce = stale && mForcedReanalyses < MAX_FORCED_REANALYSES;
+                        // A device action (open_app / list_apps) may leave the
+                        // screen unchanged but always produces new information
+                        // for the model, so analyse the very next frame.
+                        boolean forceNow = mForceNextAnalysis;
+                        boolean allowForce = forceNow
+                                || (stale && mForcedReanalyses < MAX_FORCED_REANALYSES);
                         boolean escalate;
                         if (allowForce) {
                             escalate = mFrameDetector.forceAnalyze(screenshot);
                             if (escalate) {
-                                mForcedReanalyses++;
-                                mForcedRound = true;
-                                Log.i(TAG, "Stale-task watchdog: forcing re-analysis (#"
-                                        + mForcedReanalyses + ", no escalation for "
-                                        + sinceEscalationSeconds(mLastEscalationAtMs, now) + "s)");
+                                if (forceNow) {
+                                    mForceNextAnalysis = false;
+                                    mForcedReanalyses = 0;
+                                    mForcedRound = false;
+                                } else {
+                                    mForcedReanalyses++;
+                                    mForcedRound = true;
+                                    Log.i(TAG, "Stale-task watchdog: forcing re-analysis (#"
+                                            + mForcedReanalyses + ", no escalation for "
+                                            + sinceEscalationSeconds(mLastEscalationAtMs, now)
+                                            + "s)");
+                                }
                             }
                         } else {
                             escalate = mFrameDetector.shouldAnalyze(screenshot);
@@ -445,6 +476,7 @@ public class AIPhoneAssistantService extends Service {
                 screenH,
                 mCurrentTask,
                 recentActionHistory(),
+                recentObservations(),
                 new LLMClientService.LLMCallback() {
             @Override
             public void onDecision(LLMClientService.LLMDecision decision) {
@@ -481,6 +513,135 @@ public class AIPhoneAssistantService extends Service {
     private List<String> recentActionHistory() {
         int from = Math.max(0, mActionHistory.size() - PROMPT_ACTION_HISTORY);
         return new ArrayList<>(mActionHistory.subList(from, mActionHistory.size()));
+    }
+
+    /**
+     * Execute device-level actions: {@code open_app} / {@code open_shortcut} /
+     * {@code list_apps}. They are not input injections; the outcome rides into
+     * the next prompt as an observation. Runs on the capture thread; the
+     * catalogue is usually warm because the task start kicked a background
+     * build.
+     */
+    private void handleDeviceAction(InputInjectionService.InputAction action) {
+        String desc;
+        String observation;
+        if (action.type == InputInjectionService.ActionType.LIST_APPS) {
+            AppCatalog catalog = AppCatalog.get(this);
+            String query = action.query == null ? "" : action.query.trim();
+            // Long answers are useful for a broad query, but they must not
+            // crowd out the action history in the prompt.
+            int limit = query.isEmpty() ? 30 : 25;
+            observation = catalog.describeForPrompt(query, limit);
+            desc = getString(R.string.chat_action_list_apps_format,
+                    query.isEmpty() ? "*" : query);
+        } else if (action.type == InputInjectionService.ActionType.OPEN_SHORTCUT) {
+            String requested = action.app == null ? "" : action.app.trim();
+            String wanted = action.shortcut == null ? "" : action.shortcut.trim();
+            AppCatalog catalog = AppCatalog.get(this);
+            AppCatalog.App app = catalog.resolve(requested);
+            String failure = null;
+            String shortcutId = null;
+            if (app == null) {
+                failure = getString(R.string.observation_open_app_unknown_format, requested);
+            } else {
+                shortcutId = app.resolveShortcutId(wanted);
+                if (shortcutId == null) {
+                    failure = "No shortcut matching \"" + wanted + "\" in " + app.label;
+                } else {
+                    try {
+                        LauncherApps launcherApps = getSystemService(LauncherApps.class);
+                        if (launcherApps == null) {
+                            failure = "LauncherApps service unavailable";
+                        } else {
+                            launcherApps.startShortcut(app.pkg, shortcutId, null, null,
+                                    android.os.Process.myUserHandle());
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "Shortcut launch failed: " + app.pkg + "/" + shortcutId, e);
+                        failure = "Shortcut launch failed: " + e.getMessage();
+                    }
+                }
+            }
+            if (failure != null) {
+                observation = failure;
+                desc = "open_shortcut failed: " + requested + " / " + wanted;
+            } else {
+                observation = "Opened shortcut \"" + wanted + "\" (" + shortcutId + ") in "
+                        + app.label;
+                desc = "Opened " + app.label + " shortcut: " + wanted;
+                mFrameDetector.notifyActionInjected();
+                sleepQuietly(APP_LAUNCH_SETTLE_MS);
+            }
+        } else {
+            String requested = action.app == null ? "" : action.app.trim();
+            AppCatalog catalog = AppCatalog.get(this);
+            AppCatalog.App app = catalog.resolve(requested);
+            if (app == null) {
+                observation = getString(R.string.observation_open_app_unknown_format, requested);
+                desc = getString(R.string.chat_action_open_app_failed_format, requested);
+            } else {
+                Intent intent = AppCatalog.buildLaunchIntent(this, app, action.uri);
+                String failure = null;
+                if (intent == null) {
+                    failure = getString(R.string.observation_open_app_no_intent_format, app.label);
+                } else {
+                    try {
+                        startActivity(intent);
+                    } catch (Exception e) {
+                        Log.w(TAG, "Launch failed for " + app.pkg, e);
+                        failure = getString(R.string.observation_open_app_failed_format,
+                                app.label, String.valueOf(e.getMessage()));
+                    }
+                }
+                if (failure != null) {
+                    observation = failure;
+                    desc = getString(R.string.chat_action_open_app_failed_format, requested);
+                } else {
+                    observation = getString(R.string.observation_open_app_ok_format,
+                            app.label, app.pkg);
+                    desc = action.uri == null || action.uri.isEmpty()
+                            ? getString(R.string.chat_action_open_app_format, app.label)
+                            : getString(R.string.chat_action_open_app_uri_format,
+                                    app.label, action.uri);
+                    // The window transition is a real change; give the target
+                    // app time to draw before the next capture.
+                    mFrameDetector.notifyActionInjected();
+                    sleepQuietly(APP_LAUNCH_SETTLE_MS);
+                }
+            }
+        }
+
+        Log.i(TAG, "Device action: " + desc + " -> " + shorten(observation));
+        addObservation(observation);
+        mActionHistory.add(desc);
+        mChatStore.appendAction(mConvId, desc, mCurrentFrame);
+        mForcedReanalyses = 0;
+        mForcedRound = false;
+        // The observation is only useful if the model gets another round, and a
+        // list_apps answer does not change the screen at all.
+        mForceNextAnalysis = true;
+        broadcastState(ChatStore.STATE_EXECUTING);
+        updateFgNotification(getString(R.string.notification_acting_format, desc));
+    }
+
+    /** Device observations since the task started, oldest first. */
+    private List<String> recentObservations() {
+        return new ArrayList<>(mObservations);
+    }
+
+    /** Append one observation, keeping the ring bounded. */
+    private void addObservation(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return;
+        }
+        String flat = text.trim();
+        if (flat.length() > OBSERVATION_MAX_CHARS) {
+            flat = flat.substring(0, OBSERVATION_MAX_CHARS) + "…";
+        }
+        mObservations.add(flat);
+        while (mObservations.size() > PROMPT_OBSERVATION_LIMIT) {
+            mObservations.remove(0);
+        }
     }
 
     /** Mark the current analysis round as finished and cancel its timeout. */
@@ -539,6 +700,16 @@ public class AIPhoneAssistantService extends Service {
                 // Stop/resume was requested while the request was in flight:
                 // skip injecting a stale decision. After a resume the frame
                 // detector is re-baselined and the screen is re-analyzed.
+                return;
+            }
+
+            // Device-level actions are not input injections: resolve them
+            // against the app catalogue and let the outcome ride into the next
+            // prompt as an observation.
+            if (decision.action.type == InputInjectionService.ActionType.OPEN_APP
+                    || decision.action.type == InputInjectionService.ActionType.OPEN_SHORTCUT
+                    || decision.action.type == InputInjectionService.ActionType.LIST_APPS) {
+                handleDeviceAction(decision.action);
                 return;
             }
 
@@ -946,6 +1117,15 @@ public class AIPhoneAssistantService extends Service {
                 return getString(R.string.chat_action_text_format, action.text);
             case WAIT:
                 return getString(R.string.chat_action_wait_format, action.durationMs);
+            case OPEN_APP:
+                return getString(R.string.chat_action_open_app_format,
+                        action.app == null ? "" : action.app);
+            case OPEN_SHORTCUT:
+                return "open_shortcut " + (action.app == null ? "" : action.app)
+                        + " / " + (action.shortcut == null ? "" : action.shortcut);
+            case LIST_APPS:
+                return getString(R.string.chat_action_list_apps_format,
+                        action.query == null || action.query.isEmpty() ? "*" : action.query);
             default:
                 return action.type.name();
         }

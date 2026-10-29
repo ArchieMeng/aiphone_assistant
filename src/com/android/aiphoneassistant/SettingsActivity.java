@@ -173,6 +173,11 @@ public class SettingsActivity extends Activity {
 
         // Test connection
         layout.addView(createButton("Test Connection", () -> testConnection()));
+        addSpacer(layout);
+
+        // App catalogue: what open_app / list_apps will see. Written as JSON so
+        // it can be pulled with `adb pull` and inspected off-device.
+        layout.addView(createButton("Dump App Catalog (JSON)", () -> dumpAppCatalog()));
 
         // ScrollView so the form stays usable on small screens
         android.widget.ScrollView scroll = new android.widget.ScrollView(this);
@@ -194,6 +199,31 @@ public class SettingsActivity extends Activity {
     private String taskDisplayValue() {
         String task = mPrefs.getString(LLMClientService.KEY_TASK, "");
         return task == null || task.trim().isEmpty() ? "(not set - assistant idles)" : task;
+    }
+
+    /**
+     * Build the app catalogue on a background thread and write the full JSON
+     * dump into the app's files dir, so the capability inventory can be pulled
+     * off the device and reviewed.
+     */
+    private void dumpAppCatalog() {
+        Toast.makeText(this, "Building app catalog…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String message;
+            try {
+                AppCatalog catalog = AppCatalog.get(getApplicationContext());
+                java.io.File out = new java.io.File(getFilesDir(), "app-catalog.json");
+                try (java.io.FileWriter writer = new java.io.FileWriter(out)) {
+                    writer.write(catalog.toJson());
+                }
+                message = catalog.size() + " apps → " + out.getAbsolutePath();
+            } catch (Exception e) {
+                android.util.Log.e(TAG, "App catalog dump failed", e);
+                message = "Catalog dump failed: " + e.getMessage();
+            }
+            final String text = message;
+            runOnUiThread(() -> Toast.makeText(this, text, Toast.LENGTH_LONG).show());
+        }, "app-catalog-dump").start();
     }
 
     private String backendDisplayValue() {

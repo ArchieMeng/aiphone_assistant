@@ -96,11 +96,13 @@ public class LLMClientService {
     private static final String ACTION_SCHEMA = "{\"type\":\"object\",\"properties\":{"
             + "\"action\":{\"type\":\"string\",\"enum\":[\"tap\",\"swipe\","
             + "\"long_press\",\"scroll\",\"key_press\",\"text_input\",\"wait\","
-            + "\"none\",\"done\"]},"
+            + "\"open_app\",\"open_shortcut\",\"list_apps\",\"none\",\"done\"]},"
             + "\"x\":" + COORD + ",\"y\":" + COORD + ","
             + "\"endX\":" + COORD + ",\"endY\":" + COORD + ","
             + "\"deltaY\":{\"type\":\"integer\"},\"durationMs\":{\"type\":\"integer\"},"
             + "\"key\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
+            + "\"app\":{\"type\":\"string\"},\"uri\":{\"type\":\"string\"},"
+            + "\"shortcut\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},"
             + "\"summary\":{\"type\":\"string\"}},"
             + "\"required\":[\"action\"],\"additionalProperties\":false}";
 
@@ -173,6 +175,17 @@ public class LLMClientService {
      */
     public void analyzeScreen(Bitmap screenshot, int screenW, int screenH, String task,
             List<String> recentActions, LLMCallback callback) {
+        analyzeScreen(screenshot, screenW, screenH, task, recentActions, null, callback);
+    }
+
+    /**
+     * Like the 6-argument overload, but also forwards {@code observations}:
+     * what list_apps / open_app reported earlier in this task. A device action
+     * may leave the screen unchanged, so the result is only useful once it is
+     * fed back into the next prompt.
+     */
+    public void analyzeScreen(Bitmap screenshot, int screenW, int screenH, String task,
+            List<String> recentActions, List<String> observations, LLMCallback callback) {
         SharedPreferences prefs = getPrefs(mContext);
         String endpoint = prefs.getString(KEY_ENDPOINT, "").trim();
         String apiKey = prefs.getString(KEY_API_KEY, "").trim();
@@ -202,7 +215,7 @@ public class LLMClientService {
                 int coordW = local ? NORMALIZED_COORDS : scaled.getWidth();
                 int coordH = local ? NORMALIZED_COORDS : scaled.getHeight();
                 String prompt = buildPrompt(task, scaled.getWidth(), scaled.getHeight(),
-                        recentActions, local);
+                        recentActions, observations, local);
                 String response;
                 if (local) {
                     requireLocal();
@@ -353,7 +366,7 @@ public class LLMClientService {
     }
 
     private String buildPrompt(String task, int imageWidth, int imageHeight,
-            List<String> recentActions, boolean normalizedCoords) {
+            List<String> recentActions, List<String> observations, boolean normalizedCoords) {
         StringBuilder prompt = new StringBuilder();
         prompt.append("You are shown a screenshot of an Android phone");
         if (!normalizedCoords) {
@@ -369,6 +382,12 @@ public class LLMClientService {
             }
             prompt.append("Do not repeat an action that did not help; try another approach.\n");
         }
+        if (observations != null && !observations.isEmpty()) {
+            prompt.append("What the device reported earlier in this task:\n");
+            for (String observation : observations) {
+                prompt.append("- ").append(observation).append('\n');
+            }
+        }
         prompt.append("Decide the single best next action to progress the task, then answer with ")
                 .append("ONLY one JSON object and no other text:\n")
                 .append("{\"action\":\"tap\",\"x\":<int>,\"y\":<int>}\n")
@@ -381,6 +400,14 @@ public class LLMClientService {
                 .append("  // BACK, HOME, APP_SWITCH, ENTER, DEL, DPAD_UP, DPAD_DOWN, VOLUME_UP...\n")
                 .append("{\"action\":\"text_input\",\"text\":\"...\"}")
                 .append("  // only when a text field is focused\n")
+                .append("{\"action\":\"open_app\",\"app\":\"<name or package>\",")
+                .append("\"uri\":\"<optional>\"}")
+                .append("  // cheapest way to switch apps\n")
+                .append("{\"action\":\"open_shortcut\",\"app\":\"<name or package>\",")
+                .append("\"shortcut\":\"<id or label from list_apps sc:...>\"}")
+                .append("  // jump straight to an app shortcut (e.g. Bilibili/YouTube search)\n")
+                .append("{\"action\":\"list_apps\",\"query\":\"<filter>\"}")
+                .append("  // only if the name is unknown\n")
                 .append("{\"action\":\"wait\",\"durationMs\":<int>}")
                 .append("  // when the screen is still loading\n")
                 .append("{\"action\":\"none\"}")
@@ -395,8 +422,12 @@ public class LLMClientService {
                         : "Coordinates must be in image pixel space. ")
                 .append("Rules: tap precisely on visible ")
                 .append("controls; if the previous action visibly failed, try a different approach; ")
+                .append("prefer open_app over hunting for icons; ")
                 .append("choose \"done\" when the goal is clearly reached, \"wait\" while loading, ")
-                .append("\"none\" only when stuck with nothing to try.");
+                .append("\"none\" only when stuck with nothing to try. ")
+                .append("To search inside an app: if list_apps shows an sc:search shortcut, use ")
+                .append("open_shortcut; otherwise open_app -> tap its search box -> ")
+                .append("text_input with the search words -> key_press ENTER -> tap a result.");
         return prompt.toString();
     }
 
@@ -686,6 +717,52 @@ public class LLMClientService {
                         return LLMDecision.none(response);
                     }
                     action = InputInjectionService.InputAction.textInput(text);
+                    break;
+                }
+
+                case "open_app":
+                case "launch_app":
+                case "launch":
+                case "open": {
+                    String app = json.optString("app", "").trim();
+                    if (app.isEmpty()) {
+                        app = json.optString("package", "").trim();
+                    }
+                    if (app.isEmpty()) {
+                        app = json.optString("name", "").trim();
+                    }
+                    if (app.isEmpty()) {
+                        Log.w(TAG, "open_app without an app name, ignoring");
+                        return LLMDecision.none(response);
+                    }
+                    action = InputInjectionService.InputAction.openApp(
+                            app, json.optString("uri", "").trim());
+                    break;
+                }
+
+                case "open_shortcut":
+                case "shortcut": {
+                    String app = json.optString("app", "").trim();
+                    if (app.isEmpty()) {
+                        app = json.optString("package", "").trim();
+                    }
+                    String shortcut = json.optString("shortcut", "").trim();
+                    if (shortcut.isEmpty()) {
+                        shortcut = json.optString("id", "").trim();
+                    }
+                    if (app.isEmpty() || shortcut.isEmpty()) {
+                        Log.w(TAG, "open_shortcut without app/shortcut, ignoring");
+                        return LLMDecision.none(response);
+                    }
+                    action = InputInjectionService.InputAction.openShortcut(app, shortcut);
+                    break;
+                }
+
+                case "list_apps":
+                case "list_app":
+                case "apps": {
+                    action = InputInjectionService.InputAction.listApps(
+                            json.optString("query", "").trim());
                     break;
                 }
 

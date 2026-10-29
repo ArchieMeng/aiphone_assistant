@@ -400,7 +400,13 @@ public class InputInjectionService {
         DOUBLE_TAP,
         PINCH,
         WAIT,
-        NONE
+        NONE,
+        /** Launch an installed app (optionally at a deep-link URI). */
+        OPEN_APP,
+        /** Launch one of an app's launcher shortcuts (e.g. Bilibili "search"). */
+        OPEN_SHORTCUT,
+        /** Enumerate installed apps and their entry points. Not an injection. */
+        LIST_APPS
     }
 
     /** Represents an input action to be executed. */
@@ -414,6 +420,14 @@ public class InputInjectionService {
         public int keyCode;
         public String text;
         public float deltaY;
+        /** {@link ActionType#OPEN_APP}: display name or package name. */
+        public String app;
+        /** {@link ActionType#OPEN_APP}: optional deep link / URI to open inside it. */
+        public String uri;
+        /** {@link ActionType#OPEN_SHORTCUT}: shortcut id or visible label. */
+        public String shortcut;
+        /** {@link ActionType#LIST_APPS}: filter, empty = launchable apps only. */
+        public String query;
 
         public static InputAction tap(float x, float y) {
             InputAction action = new InputAction();
@@ -471,6 +485,31 @@ public class InputInjectionService {
             InputAction action = new InputAction();
             action.type = ActionType.WAIT;
             action.durationMs = Math.min(Math.max(durationMs, 100), 5000);
+            return action;
+        }
+
+        /** Launch an app by display name / package, optionally at a URI. */
+        public static InputAction openApp(String app, String uri) {
+            InputAction action = new InputAction();
+            action.type = ActionType.OPEN_APP;
+            action.app = app;
+            action.uri = uri;
+            return action;
+        }
+
+        /** Ask the device which apps are installed and how they can be entered. */
+        public static InputAction openShortcut(String app, String shortcut) {
+            InputAction action = new InputAction();
+            action.type = ActionType.OPEN_SHORTCUT;
+            action.app = app;
+            action.shortcut = shortcut;
+            return action;
+        }
+
+        public static InputAction listApps(String query) {
+            InputAction action = new InputAction();
+            action.type = ActionType.LIST_APPS;
+            action.query = query;
             return action;
         }
 

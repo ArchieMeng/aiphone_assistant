@@ -139,6 +139,8 @@ The model must answer with a single JSON object:
 {"action": "scroll", "x": 540, "y": 1200, "deltaY": -400}
 {"action": "key_press", "key": "BACK"}
 {"action": "text_input", "text": "hello world"}
+{"action": "open_app", "app": "微信", "uri": "weixin://"}
+{"action": "list_apps", "query": "chat"}
 {"action": "wait", "durationMs": 1000}
 {"action": "none"}
 ```
@@ -147,6 +149,17 @@ The model must answer with a single JSON object:
   in the prompt) and are rescaled to screen coordinates automatically.
 - Key names: `BACK`, `HOME`, `APP_SWITCH`, `ENTER`, `DEL`, `SPACE`, `TAB`,
   `DPAD_UP/DOWN/LEFT/RIGHT`, `VOLUME_UP/DOWN/MUTE`, `POWER`, ...
+- **`open_app`** launches an installed app by display name or package, and
+  optionally at a deep-link URI. It resolves through the on-device catalogue
+  (`AppCatalog`) instead of hunting for the launcher icon, so it also works
+  when the icon is on a different home screen. A failed launch is reported
+  back to the model in the next prompt.
+- **`list_apps`** answers with a compact inventory of the installed apps:
+  package, version, whether it is launchable, the URI schemes it handles
+  (deep links, e.g. `weixin://dl/...`), the share MIME types it accepts and
+  its launcher shortcuts. Use it when the app name is unclear. The full
+  inventory (including intent targets and component names) is written as
+  JSON by *Settings → Dump App Catalog (JSON)*.
 - Malformed answers or actions with missing coordinates are ignored — the
   app never guesses a default tap position.
 
