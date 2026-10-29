@@ -75,6 +75,29 @@ public class LLMClientService {
     public static final String KEY_BACKEND = "backend";
     public static final String KEY_LOCAL_MODEL_PATH = "local_model_path";
     public static final String KEY_LOCAL_ACCEL = "local_accel";
+    // Fast/strong cascade (remote API): the fast model answers routine steps;
+    // the strong model is consulted only when the fast loop is stuck. Empty
+    // fast model falls back to KEY_MODEL; empty strong model disables escalation.
+    public static final String KEY_MODEL_FAST = "model_fast";
+    public static final String KEY_MODEL_STRONG = "model_strong";
+    // Which transport serves escalated (strong) rounds: "" = same as the fast
+    // backend, "remote" = OpenAI-compatible endpoint, "local" = on-device.
+    // This allows fast = on-device and strong = online (or vice versa).
+    public static final String KEY_STRONG_BACKEND = "strong_backend";
+    // Strong rounds are allowed to think by default (they are the "ask the big
+    // model to reason about the stuck screen" path). Can be turned off.
+    public static final String KEY_STRONG_THINKING = "strong_thinking";
+    public static final boolean DEFAULT_STRONG_THINKING = true;
+    // Ask the provider to skip hidden chain-of-thought on the fast path. Only
+    // fields documented by the matching API family are sent (see
+    // applyFastResponseParams), so strict servers are not confused.
+    public static final String KEY_DISABLE_THINKING = "disable_thinking";
+    public static final boolean DEFAULT_DISABLE_THINKING = true;
+    // Output cap: one action JSON is < 200 tokens. A low cap alone does not
+    // stop a thinking model (reasoning tokens are billed against it), but it
+    // bounds the worst case together with the disable-thinking hints.
+    public static final String KEY_MAX_TOKENS = "max_tokens";
+    public static final int DEFAULT_MAX_TOKENS = 1024;
     public static final String BACKEND_REMOTE = "remote";
     public static final String BACKEND_LOCAL = "local";
     public static final int DEFAULT_CAPTURE_INTERVAL_MS = 500;
@@ -137,6 +160,15 @@ public class LLMClientService {
                 && BACKEND_LOCAL.equals(prefs.getString(KEY_BACKEND, BACKEND_REMOTE));
     }
 
+    /** Local build + the strong-backend preference resolved to on-device. */
+    public static boolean isLocalStrongBackend(SharedPreferences prefs) {
+        String strongBackend = prefs.getString(KEY_STRONG_BACKEND, "").trim();
+        if (strongBackend.isEmpty()) {
+            return isLocalBackend(prefs);
+        }
+        return BACKEND_LOCAL.equals(strongBackend) && LocalInference.isAvailable();
+    }
+
     /** Configured on-device model path, defaulting to the app's files dir. */
     public static String localModelPath(Context context) {
         String path = getPrefs(context).getString(KEY_LOCAL_MODEL_PATH, "").trim();
@@ -173,11 +205,44 @@ public class LLMClientService {
      */
     public void analyzeScreen(Bitmap screenshot, int screenW, int screenH, String task,
             List<String> recentActions, LLMCallback callback) {
+        analyzeScreen(screenshot, screenW, screenH, task, recentActions, false, callback);
+    }
+
+    /**
+     * Like the 6-argument overload, but with a fast/strong cascade hint: when
+     * {@code preferStrong} is true and a strong model is configured, that model
+     * serves this round. The caller escalates after repeated "none" answers,
+     * request failures or a stale-screen watchdog round.
+     */
+    public void analyzeScreen(Bitmap screenshot, int screenW, int screenH, String task,
+            List<String> recentActions, boolean preferStrong, LLMCallback callback) {
         SharedPreferences prefs = getPrefs(mContext);
         String endpoint = prefs.getString(KEY_ENDPOINT, "").trim();
         String apiKey = prefs.getString(KEY_API_KEY, "").trim();
-        String model = prefs.getString(KEY_MODEL, "gpt-4o").trim();
-        boolean local = isLocalBackend(prefs);
+        String legacyModel = prefs.getString(KEY_MODEL, "gpt-4o").trim();
+        String fastModel = prefs.getString(KEY_MODEL_FAST, "").trim();
+        if (fastModel.isEmpty()) {
+            fastModel = legacyModel;
+        }
+        String strongModel = prefs.getString(KEY_MODEL_STRONG, "").trim();
+        boolean fastLocal = isLocalBackend(prefs);
+        boolean strongLocal = isLocalStrongBackend(prefs);
+        // A strong round is possible if its transport is configured: for the
+        // remote transport that needs a model name; for the local transport it
+        // just needs the LiteRT-LM backend to be compiled in.
+        boolean strongConfigured = strongLocal || !strongModel.isEmpty();
+        boolean escalated = preferStrong && strongConfigured;
+        boolean local = escalated ? strongLocal : fastLocal;
+        if (escalated && !local && endpoint.isEmpty()) {
+            // Strong backend is remote but no endpoint: keep the fast backend.
+            Log.w(TAG, "Escalation requested but the remote endpoint is empty; "
+                    + "staying on the fast backend");
+            escalated = false;
+            local = fastLocal;
+        }
+        String model = escalated && !strongLocal ? strongModel : fastModel;
+        boolean disableThinking = prefs.getBoolean(KEY_DISABLE_THINKING,
+                DEFAULT_DISABLE_THINKING);
         String modelPath = localModelPath(mContext);
         String accel = localAccel(mContext);
 
@@ -189,37 +254,55 @@ public class LLMClientService {
         }
 
         mCancelled.set(false);
+        // Resolve the per-round choices into effectively-final values so the
+        // request thread can capture them (the method reassigns local/escalated
+        // while validating the configuration above).
+        final boolean localBackend = local;
+        final boolean escalatedRound = escalated;
+        final boolean allowThinking = escalatedRound && prefs.getBoolean(
+                KEY_STRONG_THINKING, DEFAULT_STRONG_THINKING);
+        final boolean thinkingSuppressed = disableThinking && !allowThinking;
         // A dedicated thread per request: a hung gateway response must never
         // block later analysis rounds (the single-thread executor would).
         Thread t = new Thread(() -> {
             try {
                 Bitmap scaled = scaleBitmap(screenshot,
-                        local ? LOCAL_MAX_IMAGE_SIZE : MAX_IMAGE_SIZE);
+                        localBackend ? LOCAL_MAX_IMAGE_SIZE : MAX_IMAGE_SIZE);
                 // Gemma grounds in Gemini-style coordinates normalized to
                 // 0-1000 regardless of the image size (asking for pixels
                 // still yields 0-1000 values), so the local prompt asks for
                 // that space and replies are rescaled from 1000x1000.
-                int coordW = local ? NORMALIZED_COORDS : scaled.getWidth();
-                int coordH = local ? NORMALIZED_COORDS : scaled.getHeight();
-                String prompt = buildPrompt(task, scaled.getWidth(), scaled.getHeight(),
-                        recentActions, local);
+                int coordW = localBackend ? NORMALIZED_COORDS : scaled.getWidth();
+                int coordH = localBackend ? NORMALIZED_COORDS : scaled.getHeight();
+                // Static instructions are the cacheable system message; the
+                // per-round task/history are the user message.
+                String instructions = buildInstructions(localBackend, escalatedRound);
+                String prompt = buildUserPrompt(task, scaled.getWidth(),
+                        scaled.getHeight(), recentActions);
                 String response;
-                if (local) {
+                if (localBackend) {
                     requireLocal();
-                    response = mLocal.generate(modelPath, accel, prompt, bitmapToJpeg(scaled),
+                    response = mLocal.generate(modelPath, accel,
+                            instructions + "\n\n" + prompt, bitmapToJpeg(scaled),
                             ACTION_SCHEMA);
                     Log.i(TAG, "Local reply: " + shorten(response, 200));
                 } else {
+                    Log.i(TAG, "Round model: " + model
+                            + (escalatedRound ? " (strong, escalated)" : " (fast)")
+                            + ", backend=" + (localBackend ? "local" : "remote")
+                            + ", thinking=" + (thinkingSuppressed ? "off" : "on")
+                            + ", prompt chars=" + (instructions.length() + prompt.length()));
                     String imageBase64 = Base64.encodeToString(bitmapToJpeg(scaled),
                             Base64.NO_WRAP);
-                    response = sendToLLM(endpoint, apiKey, model, prompt, imageBase64);
+                    response = sendToLLM(endpoint, apiKey, model, instructions, prompt,
+                            imageBase64, disableThinking, allowThinking);
                 }
                 LLMDecision parsed = parseDecision(response, screenW, screenH,
                         coordW, coordH);
                 // The prompt history must be in the model's coordinate space,
                 // or it copies screen-pixel values back as 0-1000 coordinates.
                 // The constrained reply is exactly the action JSON.
-                LLMDecision decision = local
+                LLMDecision decision = localBackend
                         ? parsed.withHistoryEntry(shorten(response, 200)) : parsed;
                 if (scaled != screenshot) {
                     scaled.recycle();
@@ -291,7 +374,8 @@ public class LLMClientService {
         mExecutor.execute(() -> {
             try {
                 String reply = sendToLLM(endpoint, apiKey, model,
-                        "Reply with the single word OK and nothing else.", null);
+                        "You are a connectivity probe.",
+                        "Reply with the single word OK and nothing else.", null, false, false);
                 mMainHandler.post(() -> {
                     if (callback != null) {
                         callback.onResult(true, "Model replied: " + shorten(reply, 60));
@@ -352,52 +436,98 @@ public class LLMClientService {
         return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
-    private String buildPrompt(String task, int imageWidth, int imageHeight,
-            List<String> recentActions, boolean normalizedCoords) {
-        StringBuilder prompt = new StringBuilder();
-        prompt.append("You are shown a screenshot of an Android phone");
-        if (!normalizedCoords) {
-            prompt.append(" (image size: ").append(imageWidth).append("x")
-                    .append(imageHeight).append(" pixels)");
+    /**
+     * Static, per-round-identical instructions. Sent as the system message so
+     * OpenAI-compatible providers can reuse their prompt cache, and so the
+     * fast model never has to re-read the action menu from scratch.
+     *
+     * The prompt is deliberately terse and explicitly forbids chain-of-thought:
+     * a screen-action model that "thinks" for thousands of tokens turns every
+     * 2-second step into a 10-30 second step for zero accuracy gain.
+     */
+    private String buildInstructions(boolean normalizedCoords, boolean strong) {
+        StringBuilder p = new StringBuilder();
+        if (strong) {
+            // Escalation rounds may think: the fast policy is stuck, and a
+            // plan/reasoning pass is exactly what the strong model is for.
+            p.append("You are the STRONG escalation model for an Android phone agent. ")
+                    .append("The fast policy has been stuck (it repeated screens/actions). ")
+                    .append("You may reason about the screenshot and the action history ")
+                    .append("before answering. Start a NEW strategy instead of repeating the ")
+                    .append("failed actions (e.g. use open_app, BACK, scroll, or wait). ")
+                    .append("Finish with exactly ONE JSON object from the list below, ")
+                    .append("as the last thing in your reply, and nothing after it.\n");
+        } else {
+            p.append("You control an Android phone from ONE screenshot per step. ")
+                    .append("Answer IMMEDIATELY with exactly one JSON object: no analysis, ")
+                    .append("no step-by-step reasoning, no prose.\n");
         }
-        prompt.append(". ")
-                .append("The user's task: \"").append(task).append("\".\n");
-        if (recentActions != null && !recentActions.isEmpty()) {
-            prompt.append("Actions you already performed for this task, oldest first:\n");
-            for (int i = 0; i < recentActions.size(); i++) {
-                prompt.append(i + 1).append(". ").append(recentActions.get(i)).append('\n');
-            }
-            prompt.append("Do not repeat an action that did not help; try another approach.\n");
-        }
-        prompt.append("Decide the single best next action to progress the task, then answer with ")
-                .append("ONLY one JSON object and no other text:\n")
+        p.append("Actions (choose one):\n")
                 .append("{\"action\":\"tap\",\"x\":<int>,\"y\":<int>}\n")
-                .append("{\"action\":\"swipe\",\"x\":<int>,\"y\":<int>,\"endX\":<int>,\"endY\":<int>,")
+                .append("{\"action\":\"swipe\",\"x\":<int>,\"y\":<int>,\"endX\":<int>,")
+                .append("\"endY\":<int>,\"durationMs\":<int>}\n")
+                .append("{\"action\":\"long_press\",\"x\":<int>,\"y\":<int>,")
                 .append("\"durationMs\":<int>}\n")
-                .append("{\"action\":\"long_press\",\"x\":<int>,\"y\":<int>,\"durationMs\":<int>}\n")
-                .append("{\"action\":\"scroll\",\"x\":<int>,\"y\":<int>,\"deltaY\":<int>}")
-                .append("  // negative deltaY scrolls content up\n")
-                .append("{\"action\":\"key_press\",\"key\":\"BACK\"}")
-                .append("  // BACK, HOME, APP_SWITCH, ENTER, DEL, DPAD_UP, DPAD_DOWN, VOLUME_UP...\n")
-                .append("{\"action\":\"text_input\",\"text\":\"...\"}")
-                .append("  // only when a text field is focused\n")
-                .append("{\"action\":\"wait\",\"durationMs\":<int>}")
-                .append("  // when the screen is still loading\n")
-                .append("{\"action\":\"none\"}")
-                .append("  // nothing useful can be done right now; prefer \"wait\" for loading\n")
-                .append("{\"action\":\"done\",\"summary\":\"<one short sentence>\"}")
-                .append("  // ONLY when the task's goal is now VISIBLY achieved on this screen; ")
-                .append("write the summary in the same language as the user's task\n")
+                .append("{\"action\":\"scroll\",\"x\":<int>,\"y\":<int>,")
+                .append("\"deltaY\":<int>}  // negative deltaY scrolls content up\n")
+                .append("{\"action\":\"key_press\",\"key\":\"BACK\"}  // BACK|HOME|")
+                .append("APP_SWITCH|ENTER|DEL|DPAD_UP|DPAD_DOWN|VOLUME_UP...\n")
+                .append("{\"action\":\"text_input\",\"text\":\"...\"}  ")
+                .append("// focused text field; ANY language/Unicode (pasted), ")
+                .append("e.g. Chinese search queries\n")
+                .append("{\"action\":\"open_app\",\"app\":\"<name or package>\",")
+                .append("\"uri\":\"<optional>\"}  // cheapest way to switch apps\n")
+                .append("{\"action\":\"open_shortcut\",\"app\":\"<name or package>\",")
+                .append("\"shortcut\":\"<id or label from list_apps sc:...>\"}  ")
+                .append("// jump straight to an app shortcut (e.g. Bilibili/YouTube search)\n")
+                .append("{\"action\":\"double_tap\",\"x\":<int>,\"y\":<int>}\n")
+                .append("{\"action\":\"open_uri\",\"uri\":\"<https://... or app deep link>\"}\n")
+                .append("{\"action\":\"expand_notifications\"}  // pull down the notification shade\n")
+                .append("{\"action\":\"expand_quick_settings\"}  // pull down quick settings\n")
+                .append("{\"action\":\"list_apps\",\"query\":\"<filter>\"}  // only if the name is unknown\n")
+                .append("{\"action\":\"wait\",\"durationMs\":<int>}  // screen still loading\n")
+                .append("{\"action\":\"none\"}  // no useful action right now\n")
+                .append("{\"action\":\"done\",\"summary\":\"<one short sentence>\"}  ")
+                .append("// goal VISIBLY achieved; summary in the task's language\n")
+                .append("BATCH: instead of one action you may return ")
+                .append("{\"steps\":[{...},{...}]} with up to 12 gesture steps ")
+                .append("(tap/swipe/drag/long_press/double_tap/key_press/text_input/scroll/wait). ")
+                .append("They run in order and then a new screenshot is taken, which is much ")
+                .append("faster for known blind sequences (search flow, game combos, repeated ")
+                .append("taps). Do NOT batch steps whose choice depends on intermediate screens, ")
+                .append("and never put open_app/open_shortcut/open_uri/list_apps inside steps.\n")
                 .append(normalizedCoords
-                        ? "Coordinates are normalized to 0-" + NORMALIZED_COORDS + " on both axes "
-                                + "(0,0 = top-left, " + NORMALIZED_COORDS + "," + NORMALIZED_COORDS
-                                + " = bottom-right of the screenshot). "
-                        : "Coordinates must be in image pixel space. ")
-                .append("Rules: tap precisely on visible ")
-                .append("controls; if the previous action visibly failed, try a different approach; ")
-                .append("choose \"done\" when the goal is clearly reached, \"wait\" while loading, ")
-                .append("\"none\" only when stuck with nothing to try.");
-        return prompt.toString();
+                        ? "Coordinates are normalized to 0-" + NORMALIZED_COORDS
+                                + " on both axes (0,0 top-left). "
+                        : "Coordinates are image pixels. ")
+                .append("Rules: tap only visible controls; never repeat a failed action; ")
+                .append("prefer open_app over hunting for icons; wait while loading; ")
+                .append("done only when the goal is clearly visible on this screen. ")
+                .append("To search inside an app: if list_apps shows an sc:search shortcut, use ")
+                .append("open_shortcut; otherwise open_app -> tap its search box -> ")
+                .append("text_input with the search words -> key_press ENTER -> tap a result.");
+        return p.toString();
+    }
+
+    /**
+     * Per-round user message: the task plus the bounded action history. Keeping
+     * this short matters more than the instructions: it changes every round and
+     * therefore cannot be served from the provider's prompt cache.
+     */
+    private String buildUserPrompt(String task, int imageWidth, int imageHeight,
+            List<String> recentActions) {
+        StringBuilder p = new StringBuilder();
+        p.append("Screenshot: ").append(imageWidth).append("x").append(imageHeight)
+                .append(" px. Task: \"").append(task).append("\"\n");
+        if (recentActions != null && !recentActions.isEmpty()) {
+            p.append("Done so far (oldest first):\n");
+            for (int i = 0; i < recentActions.size(); i++) {
+                p.append(i + 1).append(". ").append(recentActions.get(i)).append('\n');
+            }
+            p.append("Do not repeat an action that did not help.\n");
+        }
+        p.append("Next action JSON:");
+        return p.toString();
     }
 
     /** Downscale so the largest dimension is at most {@code maxSize}. */
@@ -420,23 +550,87 @@ public class LLMClientService {
     }
 
     /**
+     * Ask the provider to skip hidden chain-of-thought on the fast path.
+     * Only fields documented by the matching API family are added: OpenAI-style
+     * servers reject unknown top-level parameters with HTTP 400, so guessing a
+     * generic field would break more deployments than it speeds up.
+     */
+    private void applyFastResponseParams(JSONObject body, String endpoint, String model,
+            boolean disableThinking) throws JSONException {
+        if (!disableThinking) {
+            return;
+        }
+        String e = endpoint == null ? "" : endpoint.toLowerCase(java.util.Locale.ROOT);
+        String m = model == null ? "" : model.toLowerCase(java.util.Locale.ROOT);
+        if (e.contains("openrouter.ai")) {
+            // https://openrouter.ai/docs/features/reasoning
+            JSONObject reasoning = new JSONObject();
+            reasoning.put("enabled", false);
+            body.put("reasoning", reasoning);
+            return;
+        }
+        if (e.contains("dashscope.aliyuncs.com") || e.contains("aliyuncs.com")) {
+            // Qwen / DashScope OpenAI-compatible mode.
+            JSONObject template = new JSONObject();
+            template.put("enable_thinking", false);
+            body.put("chat_template_kwargs", template);
+            body.put("enable_thinking", false);
+            return;
+        }
+        if (e.contains("api.openai.com")
+                && (m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4")
+                        || m.startsWith("gpt-5"))) {
+            body.put("reasoning_effort", "minimal");
+            return;
+        }
+        if (e.contains("deepseek.com") && (m.contains("reasoner") || m.contains("thinking"))) {
+            // DeepSeek does not document a request-level switch in this shape;
+            // the supported way to get instant replies is a non-thinking model
+            // name (e.g. deepseek-chat) as the fast model.
+            Log.w(TAG, "Thinking model '" + model + "' is the fast model; prefer a "
+                    + "non-thinking model (e.g. deepseek-chat) for instant replies");
+        }
+    }
+
+    /**
      * POST a chat completion request. When imageBase64 is null the user message
      * is sent as plain text (used by the connection test).
      */
-    private String sendToLLM(String endpoint, String apiKey, String model, String prompt,
-            String imageBase64) throws IOException {
+    private String sendToLLM(String endpoint, String apiKey, String model, String instructions,
+            String userPrompt, String imageBase64, boolean disableThinking,
+            boolean allowThinking) throws IOException {
         JSONObject requestBody = new JSONObject();
+        // Strong rounds are allowed to think, so they get a much larger output
+        // budget; fast rounds keep the tight cap.
+        int maxTokens = DEFAULT_MAX_TOKENS;
+        try {
+            int configured = getPrefs(mContext).getInt(KEY_MAX_TOKENS, DEFAULT_MAX_TOKENS);
+            if (configured > 0) {
+                maxTokens = configured;
+            }
+        } catch (Exception ignored) {
+            // keep the default
+        }
+        if (allowThinking) {
+            maxTokens = Math.max(4096, maxTokens);
+        }
         try {
             requestBody.put("model", model);
 
             JSONArray messages = new JSONArray();
+            // Stable prefix first: providers with prompt caching (DeepSeek,
+            // OpenAI, Qwen) bill and prefill it much faster on repeat rounds.
+            JSONObject systemMessage = new JSONObject();
+            systemMessage.put("role", "system");
+            systemMessage.put("content", instructions);
+            messages.put(systemMessage);
             JSONObject userMessage = new JSONObject();
             userMessage.put("role", "user");
             if (imageBase64 != null) {
                 JSONArray content = new JSONArray();
                 JSONObject textContent = new JSONObject();
                 textContent.put("type", "text");
-                textContent.put("text", prompt);
+                textContent.put("text", userPrompt);
                 content.put(textContent);
                 JSONObject imageContent = new JSONObject();
                 imageContent.put("type", "image_url");
@@ -446,18 +640,19 @@ public class LLMClientService {
                 content.put(imageContent);
                 userMessage.put("content", content);
             } else {
-                userMessage.put("content", prompt);
+                userMessage.put("content", userPrompt);
             }
             messages.put(userMessage);
             requestBody.put("messages", messages);
-            // Generous budget: reasoning models spend tokens on the hidden
-            // chain-of-thought before the JSON answer.
-            requestBody.put("max_tokens", 4096);
-            // Stream (SSE): reasoning models can think for minutes at high
-            // max_tokens; a non-streaming POST would sit with zero bytes and
-            // get cut by intermediate proxies. Deltas accumulate in
-            // readStreamSSE below.
+            // One action JSON is far below this cap; the cap only bounds a
+            // runaway reply. Configurable via KEY_MAX_TOKENS.
+            requestBody.put("max_tokens", maxTokens);
+            // Stream (SSE): a non-streaming POST sits with zero bytes and can
+            // be cut by intermediate proxies.
             requestBody.put("stream", true);
+            // Thinking is only suppressed on the fast path. Strong rounds are
+            // the "call the big model and let it reason" path by design.
+            applyFastResponseParams(requestBody, endpoint, model, disableThinking && !allowThinking);
         } catch (JSONException e) {
             throw new IOException("Failed to build request", e);
         }
