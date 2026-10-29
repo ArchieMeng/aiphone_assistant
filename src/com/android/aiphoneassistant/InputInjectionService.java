@@ -114,6 +114,13 @@ public class InputInjectionService {
         map.put("DPAD_DOWN", KeyEvent.KEYCODE_DPAD_DOWN);
         map.put("DPAD_LEFT", KeyEvent.KEYCODE_DPAD_LEFT);
         map.put("DPAD_RIGHT", KeyEvent.KEYCODE_DPAD_RIGHT);
+        map.put("MEDIA_PLAY_PAUSE", KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE);
+        map.put("MEDIA_NEXT", KeyEvent.KEYCODE_MEDIA_NEXT);
+        map.put("MEDIA_PREVIOUS", KeyEvent.KEYCODE_MEDIA_PREVIOUS);
+        map.put("MEDIA_STOP", KeyEvent.KEYCODE_MEDIA_STOP);
+        map.put("PLAY_PAUSE", KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE);
+        map.put("NEXT", KeyEvent.KEYCODE_MEDIA_NEXT);
+        map.put("PREVIOUS", KeyEvent.KEYCODE_MEDIA_PREVIOUS);
         map.put("VOLUME_UP", KeyEvent.KEYCODE_VOLUME_UP);
         map.put("VOLUME_DOWN", KeyEvent.KEYCODE_VOLUME_DOWN);
         map.put("VOLUME_MUTE", KeyEvent.KEYCODE_VOLUME_MUTE);
@@ -146,6 +153,11 @@ public class InputInjectionService {
             case LONG_PRESS:
                 longPress(action.x, action.y, action.durationMs);
                 break;
+            case DOUBLE_TAP:
+                doubleTap(action.x, action.y);
+                break;
+            case DRAG:
+                return drag(action.x, action.y, action.endX, action.endY, action.durationMs);
             case KEY_PRESS:
                 keyPress(action.keyCode);
                 break;
@@ -243,6 +255,45 @@ public class InputInjectionService {
         return !aborted;
     }
 
+    /**
+     * Drag with a hold: press at the start point, move to the end point over
+     * {@code durationMs}, keep holding there for a moment, then release. This
+     * is the gesture 3D games expect from a virtual joystick: a plain quick
+     * swipe only looks like a camera flick, while the hold actually makes the
+     * character run. Also useful for drag-and-drop.
+     */
+    public boolean drag(float startX, float startY, float endX, float endY, long durationMs) {
+        Log.i(TAG, "Dragging (hold) from (" + startX + ", " + startY + ") to ("
+                + endX + ", " + endY + ") over " + durationMs + "ms");
+        long downTime = SystemClock.uptimeMillis();
+        long moveMs = Math.max(120, Math.min(durationMs, 2000));
+        long steps = Math.max(2, moveMs / 40);
+        float dx = (endX - startX) / steps;
+        float dy = (endY - startY) / steps;
+        injectMotionEvent(MotionEvent.ACTION_DOWN, startX, startY, downTime);
+        boolean aborted = false;
+        for (int i = 1; i <= steps; i++) {
+            if (sleepCancellable(40)) {
+                aborted = true;
+                break;
+            }
+            injectMotionEvent(MotionEvent.ACTION_MOVE, startX + dx * i, startY + dy * i,
+                    downTime);
+        }
+        if (!aborted) {
+            // Keep it pressed at the destination so the game keeps running /
+            // keeps the drag selected, then release.
+            sleepCancellable(350);
+        }
+        injectMotionEvent(MotionEvent.ACTION_UP,
+                aborted ? startX + dx * Math.max(1, steps - 1) : endX,
+                aborted ? startY + dy * Math.max(1, steps - 1) : endY, downTime);
+        mLastTouchX = aborted ? startX + dx * Math.max(1, steps - 1) : endX;
+        mLastTouchY = aborted ? startY + dy * Math.max(1, steps - 1) : endY;
+        mLastTouchTime = downTime;
+        return !aborted;
+    }
+
     /** Long press. */
     public void longPress(float x, float y, long durationMs) {
         Log.i(TAG, "Long press at (" + x + ", " + y + ") for " + durationMs + "ms");
@@ -253,6 +304,14 @@ public class InputInjectionService {
         mLastTouchX = x;
         mLastTouchY = y;
         mLastTouchTime = downTime;
+    }
+
+    /** Double tap: two taps 120 ms apart. */
+    public void doubleTap(float x, float y) {
+        Log.i(TAG, "Double tapping at (" + x + ", " + y + ")");
+        tap(x, y);
+        sleepCancellable(120);
+        tap(x, y);
     }
 
     /** Press a key. */
@@ -394,13 +453,21 @@ public class InputInjectionService {
         TAP,
         SWIPE,
         LONG_PRESS,
+        /** Press, move while holding, keep holding, release (virtual joystick). */
+        DRAG,
         KEY_PRESS,
         TEXT_INPUT,
         SCROLL,
         DOUBLE_TAP,
         PINCH,
         WAIT,
-        NONE
+        NONE,
+        /** Open a URI deep link with ACTION_VIEW. */
+        OPEN_URI,
+        /** Pull down the notification shade. */
+        EXPAND_NOTIFICATIONS,
+        /** Pull down the quick-settings shade. */
+        EXPAND_QUICK_SETTINGS
     }
 
     /** Represents an input action to be executed. */
@@ -414,6 +481,8 @@ public class InputInjectionService {
         public int keyCode;
         public String text;
         public float deltaY;
+        /** {@link ActionType#OPEN_URI}: URI to open with ACTION_VIEW. */
+        public String uri;
 
         public static InputAction tap(float x, float y) {
             InputAction action = new InputAction();
@@ -427,6 +496,18 @@ public class InputInjectionService {
                 long durationMs) {
             InputAction action = new InputAction();
             action.type = ActionType.SWIPE;
+            action.x = startX;
+            action.y = startY;
+            action.endX = endX;
+            action.endY = endY;
+            action.durationMs = durationMs;
+            return action;
+        }
+
+        public static InputAction drag(float startX, float startY, float endX, float endY,
+                long durationMs) {
+            InputAction action = new InputAction();
+            action.type = ActionType.DRAG;
             action.x = startX;
             action.y = startY;
             action.endX = endX;
@@ -471,6 +552,33 @@ public class InputInjectionService {
             InputAction action = new InputAction();
             action.type = ActionType.WAIT;
             action.durationMs = Math.min(Math.max(durationMs, 100), 5000);
+            return action;
+        }
+
+        public static InputAction openUri(String uri) {
+            InputAction action = new InputAction();
+            action.type = ActionType.OPEN_URI;
+            action.uri = uri;
+            return action;
+        }
+
+        public static InputAction expandNotifications() {
+            InputAction action = new InputAction();
+            action.type = ActionType.EXPAND_NOTIFICATIONS;
+            return action;
+        }
+
+        public static InputAction expandQuickSettings() {
+            InputAction action = new InputAction();
+            action.type = ActionType.EXPAND_QUICK_SETTINGS;
+            return action;
+        }
+
+        public static InputAction doubleTap(float x, float y) {
+            InputAction action = new InputAction();
+            action.type = ActionType.DOUBLE_TAP;
+            action.x = x;
+            action.y = y;
             return action;
         }
 
