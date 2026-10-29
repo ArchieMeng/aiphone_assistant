@@ -25,7 +25,13 @@ import android.util.Log;
 import android.view.Display;
 import android.view.IWindowManager;
 import android.view.WindowManagerGlobal;
-import android.window.ScreenCapture;
+// Android 17 (cp2a) split the platform capture API out of the public-ish
+// android.window.ScreenCapture into android.window.ScreenCaptureInternal:
+// IWindowManager.captureDisplay() now takes ScreenCaptureInternal.CaptureArgs
+// and ScreenCaptureInternal.ScreenCaptureListener. The old
+// ScreenCapture.CaptureArgs symbols no longer exist, which made the
+// previously-built APK die with NoClassDefFoundError at runtime.
+import android.window.ScreenCaptureInternal;
 
 /**
  * Screen capture via the platform's WindowManager capture API.
@@ -100,12 +106,13 @@ public class ScreenCaptureService {
             // Raw builder type: the framework's CaptureArgs.Builder is generic for
             // subclassing; plain CaptureArgs need no extra arguments.
             @SuppressLint("unchecked")
-            ScreenCapture.CaptureArgs args = new ScreenCapture.CaptureArgs.Builder().build();
-            ScreenCapture.SynchronousScreenCaptureListener listener =
-                    ScreenCapture.createSyncCaptureListener();
+            ScreenCaptureInternal.CaptureArgs args =
+                    new ScreenCaptureInternal.CaptureArgs.Builder().build();
+            ScreenCaptureInternal.SynchronousScreenCaptureListener listener =
+                    ScreenCaptureInternal.createSyncCaptureListener();
             wms.captureDisplay(Display.DEFAULT_DISPLAY, args, listener);
 
-            ScreenCapture.ScreenshotHardwareBuffer buffer = listener.getBuffer();
+            ScreenCaptureInternal.ScreenshotHardwareBuffer buffer = listener.getBuffer();
             if (buffer == null) {
                 return null;
             }
