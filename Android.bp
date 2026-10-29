@@ -80,6 +80,11 @@ aiphone_android_app {
 prebuilt_etc {
     name: "privapp-permissions-aiphoneassistant",
     src: "privapp-permissions-aiphoneassistant.xml",
+    // Soong defaults the installed file name to the module name, i.e. without
+    // the .xml suffix. PMS/SystemConfig only parses `*.xml` files under
+    // /etc/permissions, so without this the allowlist would be silently
+    // ignored (SystemConfig.java: "Non-xml file ... ignoring").
+    filename: "privapp-permissions-aiphoneassistant.xml",
     system_ext_specific: true,
     sub_dir: "permissions",
 }
