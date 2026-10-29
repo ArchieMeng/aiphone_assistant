@@ -56,6 +56,7 @@ public class SettingsActivity extends Activity {
     private TextView mBackendText;
     private TextView mModelPathText;
     private TextView mAccelText;
+    private TextView mNpuDirText;
     private ChatStore mStore;
 
     private LLMClientService mTestClient;
@@ -134,9 +135,18 @@ public class SettingsActivity extends Activity {
                                     + "gemma-4-E2B-it.litertlm. Leave empty for the default.")));
             addSpacer(layout);
 
-            // On-device accelerator
+            // On-device accelerator (NPU = Qualcomm Hexagon, needs the optional
+            // dispatch/QNN libraries and falls back to GPU/CPU automatically)
             mAccelText = createConfigRow(layout, "On-device Accelerator", accelDisplayValue());
             layout.addView(createButton("Change Accelerator", () -> editAccel()));
+            addSpacer(layout);
+
+            mNpuDirText = createConfigRow(layout, "NPU Library Dir", npuDirDisplayValue());
+            layout.addView(createButton("Change NPU Library Dir", () ->
+                    showEditTextDialog("NPU Library Dir", LLMClientService.KEY_NPU_LIB_DIR,
+                            "", "Empty = app native library dir (libraries bundled in the "
+                                    + "APK). Otherwise a readable dir containing "
+                                    + "libLiteRtDispatch_Qualcomm.so + libQnn* + the HTP skel.")));
             addSpacer(layout);
         }
 
@@ -202,8 +212,20 @@ public class SettingsActivity extends Activity {
     }
 
     private String accelDisplayValue() {
-        return LocalInference.ACCEL_CPU.equals(LLMClientService.localAccel(this))
-                ? "CPU" : "GPU (falls back to CPU)";
+        String accel = LLMClientService.localAccel(this);
+        if (LocalInference.ACCEL_NPU.equals(accel)) {
+            return "NPU (Hexagon; falls back to GPU/CPU)";
+        }
+        return LocalInference.ACCEL_CPU.equals(accel) ? "CPU" : "GPU (falls back to CPU)";
+    }
+
+    private String npuDirDisplayValue() {
+        String configured = mPrefs.getString(LLMClientService.KEY_NPU_LIB_DIR, "");
+        if (configured != null && !configured.trim().isEmpty()) {
+            return configured.trim();
+        }
+        String nativeDir = getApplicationInfo().nativeLibraryDir;
+        return "(app native dir: " + nativeDir + ")";
     }
 
     private void editBackend() {
@@ -222,10 +244,12 @@ public class SettingsActivity extends Activity {
     }
 
     private void editAccel() {
-        String[] labels = {"GPU (falls back to CPU)", "CPU"};
-        String[] values = {LocalInference.ACCEL_GPU, LocalInference.ACCEL_CPU};
-        int checked = LocalInference.ACCEL_CPU.equals(LLMClientService.localAccel(this))
-                ? 1 : 0;
+        String[] labels = {"NPU (Hexagon, experimental)", "GPU (falls back to CPU)", "CPU"};
+        String[] values = {LocalInference.ACCEL_NPU, LocalInference.ACCEL_GPU,
+                LocalInference.ACCEL_CPU};
+        String current = LLMClientService.localAccel(this);
+        int checked = LocalInference.ACCEL_NPU.equals(current) ? 0
+                : (LocalInference.ACCEL_CPU.equals(current) ? 2 : 1);
         new AlertDialog.Builder(this)
                 .setTitle("On-device Accelerator")
                 .setSingleChoiceItems(labels, checked, (dialog, which) -> {
@@ -380,6 +404,9 @@ public class SettingsActivity extends Activity {
             mBackendText.setText(backendDisplayValue());
             mModelPathText.setText(LLMClientService.localModelPath(this));
             mAccelText.setText(accelDisplayValue());
+            if (mNpuDirText != null) {
+                mNpuDirText.setText(npuDirDisplayValue());
+            }
         }
         mEndpointText.setText(mPrefs.getString(LLMClientService.KEY_ENDPOINT,
                 mEndpointText.getText().toString()));

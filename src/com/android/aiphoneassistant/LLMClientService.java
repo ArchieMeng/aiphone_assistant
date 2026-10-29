@@ -75,6 +75,10 @@ public class LLMClientService {
     public static final String KEY_BACKEND = "backend";
     public static final String KEY_LOCAL_MODEL_PATH = "local_model_path";
     public static final String KEY_LOCAL_ACCEL = "local_accel";
+    // Directory containing the optional NPU runtime libraries
+    // (libLiteRtDispatch_Qualcomm.so + libQnn* + skel). Empty = the app's own
+    // native library dir (libraries bundled in the APK).
+    public static final String KEY_NPU_LIB_DIR = "npu_lib_dir";
     public static final String BACKEND_REMOTE = "remote";
     public static final String BACKEND_LOCAL = "local";
     public static final int DEFAULT_CAPTURE_INTERVAL_MS = 500;
@@ -144,7 +148,27 @@ public class LLMClientService {
     }
 
     public static String localAccel(Context context) {
-        return getPrefs(context).getString(KEY_LOCAL_ACCEL, LocalInference.ACCEL_GPU);
+        String accel = getPrefs(context).getString(KEY_LOCAL_ACCEL, LocalInference.ACCEL_GPU);
+        // A build without the LiteRT-LM backend has no NPU support at all.
+        if (LocalInference.ACCEL_NPU.equals(accel) && !LocalInference.isAvailable()) {
+            return LocalInference.ACCEL_GPU;
+        }
+        return accel;
+    }
+
+    /**
+     * Directory that holds the optional NPU libraries. Defaults to the app's
+     * native library dir, which is where libraries bundled in the APK (or
+     * delivered as a Play feature module) are extracted. Users can override it
+     * with {@link #KEY_NPU_LIB_DIR} to point at a downloaded runtime.
+     */
+    public static String localNpuLibDir(Context context) {
+        String dir = getPrefs(context).getString(KEY_NPU_LIB_DIR, "").trim();
+        if (!dir.isEmpty()) {
+            return dir;
+        }
+        String nativeDir = context.getApplicationInfo().nativeLibraryDir;
+        return nativeDir == null ? "" : nativeDir;
     }
 
     /** Whether the selected backend has what it needs to serve a request. */

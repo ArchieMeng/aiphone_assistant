@@ -82,7 +82,9 @@ android_library_import {
     aars: ["litertlm-android.aar"],
     sdk_version: "current",
     min_sdk_version: "24",
-    extract_jni: true,
+    // JNI libs are handled explicitly below (cc_prebuilt modules) so the app
+    // can also carry the optional NPU libs with the same mechanism.
+    extract_jni: false,
     static_libs: ["aiphone-litertlm-deps"],
 }
 
@@ -100,4 +102,34 @@ java_import {
     sdk_version: "current",
 }
 BP
+
+# Optional NPU runtime: every extra .so in arm64-v8a/ (Qualcomm dispatch + QNN,
+# placed there by tools/fetch-npu-libs.sh) becomes a prebuilt jni_lib module
+# with a stable name. App Android.bp references them under the with_npu Soong
+# config variable; this block is regenerated on every run and is empty when no
+# NPU libraries were fetched.
+{
+    echo ""
+    echo "// Optional Qualcomm NPU runtime (regenerated from arm64-v8a/*.so)."
+    for so in "$LIBS/arm64-v8a"/*.so; do
+        [ -e "$so" ] || continue
+        base="$(basename "$so" .so)"
+        name="aiphone-npu-${base}"
+        [ "$base" = "liblitertlm_jni" ] && name="aiphone-litertlm-jni"
+        cat <<BP2
+
+cc_prebuilt_library_shared {
+    name: "${name}",
+    stem: "${base}",
+    srcs: ["arm64-v8a/$(basename "$so")"],
+    compile_multilib: "64",
+    system_shared_libs: [],
+    stl: "none",
+    strip: { none: true },
+    check_elf_files: false,
+}
+BP2
+    done
+} >> "$LIBS/Android.bp"
+
 echo "LiteRT-LM runtime ready in ${LIBS#$ROOT/}"

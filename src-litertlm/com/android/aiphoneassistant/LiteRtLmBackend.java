@@ -210,7 +210,25 @@ class LiteRtLmBackend implements LocalInference {
             throw new IOException("Model file not readable: " + modelPath);
         }
         long t0 = SystemClock.elapsedRealtime();
-        if (ACCEL_GPU.equals(accel)) {
+        // NPU first when requested: LiteRT-LM looks for the dispatch + QNN
+        // libraries in the given dir. Every failure mode (missing dispatch
+        // library, incompatible QNN runtime, model without an NPU section) is
+        // a RuntimeException/UnsatisfiedLinkError, so degrade to GPU and then
+        // CPU instead of failing the whole turn.
+        if (ACCEL_NPU.equals(accel)) {
+            try {
+                String npuDir = LLMClientService.localNpuLibDir(mContext);
+                Log.i(TAG, "NPU backend: loading dispatch/QNN libraries from " + npuDir);
+                Backend npu = new Backend.NPU(npuDir);
+                mEngine = createEngine(modelPath, npu, npu);
+                mEngineAccel = ACCEL_NPU;
+            } catch (Throwable e) {
+                Log.w(TAG, "NPU backend unavailable, falling back to GPU", e);
+                mEngine = null;
+                mEngineAccel = null;
+            }
+        }
+        if (mEngine == null && (ACCEL_GPU.equals(accel) || ACCEL_NPU.equals(accel))) {
             try {
                 mEngine = createEngine(modelPath, new Backend.GPU(), new Backend.GPU());
                 mEngineAccel = ACCEL_GPU;
@@ -240,7 +258,14 @@ class LiteRtLmBackend implements LocalInference {
         try {
             engine.initialize();
         } catch (RuntimeException e) {
-            engine.close();
+            // Log the real init failure; close() itself throws "Engine is not
+            // initialized" for a failed engine and would mask it.
+            Log.w(TAG, "Engine.initialize() failed: " + e.getMessage(), e);
+            try {
+                engine.close();
+            } catch (RuntimeException ignored) {
+                // engine was never initialized
+            }
             throw e;
         }
         return engine;
