@@ -52,6 +52,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Overlay effects drawn while thinking/acting (preinstalled apps are granted it) -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- open_app / list_apps need the whole app inventory, not just the
+         packages this app can see by default (Android 11+ package visibility).
+         Normal permission; a privileged preinstall gets it without a prompt. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <application
         android:name=".AIPhoneAssistantApplication"

@@ -92,6 +92,16 @@
     <string name="chat_action_key_format">Key %1$s</string>
     <string name="chat_action_text_format">Type \"%1$s\"</string>
     <string name="chat_action_wait_format">Wait %1$d ms</string>
+    <string name="chat_action_open_app_format">Open app: %1$s</string>
+    <string name="chat_action_open_app_uri_format">Open %1$s → %2$s</string>
+    <string name="chat_action_open_app_failed_format">Open app failed: %1$s</string>
+    <string name="chat_action_list_apps_format">List apps (%1$s)</string>
+
+    <!-- Device observations fed back into the next prompt -->
+    <string name="observation_open_app_ok_format">Opened %1$s (%2$s).</string>
+    <string name="observation_open_app_unknown_format">open_app failed: no installed app matches &quot;%1$s&quot;. Call list_apps to see the installed apps.</string>
+    <string name="observation_open_app_no_intent_format">open_app failed: %1$s has no launchable activity.</string>
+    <string name="observation_open_app_failed_format">open_app failed for %1$s: %2$s</string>
 
     <!-- Status strings -->
     <string name="status_running">Running</string>
