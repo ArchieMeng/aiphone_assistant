@@ -16,6 +16,9 @@
 
 package com.android.aiphoneassistant;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.hardware.input.InputManager;
 import android.os.SystemClock;
 import android.util.Log;
@@ -176,8 +179,12 @@ public class InputInjectionService {
     }
 
     private void injectKeyEvent(int action, int keyCode, long downTime) {
+        injectKeyEvent(action, keyCode, downTime, 0);
+    }
+
+    private void injectKeyEvent(int action, int keyCode, long downTime, int metaState) {
         long now = SystemClock.uptimeMillis();
-        KeyEvent event = new KeyEvent(downTime, now, action, keyCode, 0, 0, 0, 0,
+        KeyEvent event = new KeyEvent(downTime, now, action, keyCode, 0, metaState, 0, 0,
                 KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
         injectInputEvent(event);
     }
@@ -265,16 +272,24 @@ public class InputInjectionService {
     }
 
     /**
-     * Type text by injecting keyboard events derived from the virtual keyboard
-     * character map. Only characters the keyboard layout can produce (ASCII and
-     * common Latin punctuation) can be typed; other scripts require an IME and
-     * are not supported by this injection path.
+     * Type text into the focused field.
+     *
+     * ASCII strings are typed through the virtual keyboard character map. Any
+     * text containing non-ASCII characters (Chinese, emoji, ...) or very long
+     * strings cannot be produced by that map - those are put on the clipboard
+     * and pasted with Ctrl+V, which is what makes CJK search boxes usable.
      */
     public void textInput(String text) {
         if (text == null || text.isEmpty()) {
             return;
         }
         Log.i(TAG, "Inputting text of length " + text.length());
+        if (!isAsciiText(text) || text.length() > 200) {
+            if (pasteText(text)) {
+                return;
+            }
+            Log.w(TAG, "Clipboard paste failed; falling back to key events");
+        }
         try {
             KeyCharacterMap kcm = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD);
             KeyEvent[] events = kcm.getEvents(text.toCharArray());
@@ -323,6 +338,55 @@ public class InputInjectionService {
         mLastTouchX = x;
         mLastTouchY = endY;
         mLastTouchTime = downTime;
+    }
+
+    private static boolean isAsciiText(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c < 0x20 || c > 0x7e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Put the text on the clipboard and inject Ctrl+V into the focused field.
+     * Text fields in Android handle the hardware Ctrl+V shortcut even when no
+     * IME is attached; this bypasses the ASCII-only KeyCharacterMap limit.
+     */
+    private boolean pasteText(String text) {
+        try {
+            ClipboardManager clipboard = (ClipboardManager)
+                    mParentService.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard == null) {
+                Log.w(TAG, "No ClipboardManager");
+                return false;
+            }
+            clipboard.setPrimaryClip(ClipData.newPlainText("AIPhoneAssistant", text));
+            if (sleepCancellable(150)) {
+                return true;
+            }
+            Log.i(TAG, "Pasting " + text.length() + " chars from the clipboard");
+            long t = SystemClock.uptimeMillis();
+            // The V events must carry META_CTRL_ON themselves: a held CTRL key
+            // event does not automatically set the modifier state on the
+            // following events, and without it the IME just types a "v".
+            injectKeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_CTRL_LEFT, t);
+            sleepCancellable(30);
+            injectKeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_V, t,
+                    KeyEvent.META_CTRL_ON);
+            sleepCancellable(30);
+            injectKeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_V, t,
+                    KeyEvent.META_CTRL_ON);
+            sleepCancellable(30);
+            injectKeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_CTRL_LEFT, t);
+            sleepCancellable(60);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "Clipboard paste failed", e);
+            return false;
+        }
     }
 
     private int getKeyCodeForChar(char c) {
